@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"] }
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 
 # Logging
