@@ -18,7 +18,7 @@ homepage = "https://github.com/de2pressed/clicklume"
 [workspace.dependencies]
 # Input device handling
 evdev = "0.13"
-nix = "0.27"
+nix = "0.29"
 
 # Low-level input
 libc = "0.2"

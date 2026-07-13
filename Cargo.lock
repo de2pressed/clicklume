@@ -684,7 +684,7 @@ dependencies = [
  "evdev",
  "libc",
  "log",
- "nix 0.27.1",
+ "nix",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1201,7 +1201,7 @@ dependencies = [
  "bitvec",
  "cfg-if",
  "libc",
- "nix 0.29.0",
+ "nix",
 ]
 
 [[package]]
@@ -2096,17 +2096,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "nix"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
-dependencies = [
- "bitflags 2.13.0",
- "cfg-if",
- "libc",
 ]
 
 [[package]]
