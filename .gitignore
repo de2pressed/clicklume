@@ -1,0 +1,9 @@
+/target
+/.hermes
+/agent-docs
+/AGENTS.md
+*.log
+*.deb
+*.tar.gz
+*.sha256
+/dist

@@ -1,0 +1,37 @@
+[package]
+name = "clicklume-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ClickLume uinput and global-hotkey backend"
+
+[[bin]]
+name = "clicklume-backend"
+path = "src/main.rs"
+
+[dependencies]
+common = { package = "clicklume-common", path = "../clicklume-common" }
+
+# Input device handling
+evdev = { workspace = true }
+nix = { workspace = true, features = ["ioctl", "inotify", "fs", "poll", "event", "feature"] }
+libc = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+serde = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }

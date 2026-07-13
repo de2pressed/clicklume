@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible ClickLume problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Never paste passwords, tokens, or private input-device data.
+  - type: input
+    id: version
+    attributes:
+      label: ClickLume version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: session
+    attributes:
+      label: Desktop session
+      options:
+        - Ubuntu 24.04 / GNOME 46 / Wayland
+        - Other GNOME / Wayland
+        - Another compositor
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include exact reproduction steps and the expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste only relevant lines from journalctl --user -u clicklume.service.
+      render: shell

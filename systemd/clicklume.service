@@ -1,0 +1,31 @@
+[Unit]
+Description=ClickLume (keeps global hotkeys available)
+# Wait for GNOME Shell (Wayland compositor) to be fully ready.
+# gnome-session-initialized.target is the canonical signal that the desktop is
+# up and accepting applications. Trying to start before this gives
+# winit's WaylandEventLoop a NoCompositor panic.
+After=gnome-session-initialized.target
+Wants=gnome-session-initialized.target
+PartOf=gnome-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStart=@GUI_BIN@
+# Let the GUI receive SIGINT first so it can send Quit and reap its backend.
+# If graceful shutdown wedges, systemd kills the entire cgroup after 5 seconds.
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=5
+# Restart on crash, but NOT on clean exit. This lets the user close the
+# GUI normally (which sends Quit IPC to the backend → backend exits Ok
+# → GUI exits Ok → no restart). Crashes still recover automatically.
+Restart=on-failure
+RestartSec=3
+
+# Wayland env (WAYLAND_DISPLAY, XDG_RUNTIME_DIR) is inherited from the user
+# session automatically by systemd --user.
+
+[Install]
+WantedBy=graphical-session.target

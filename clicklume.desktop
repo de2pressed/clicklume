@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=ClickLume
+Comment=Native autoclicker for GNOME Wayland
+Exec=@GUI_BIN@
+Icon=input-mouse
+Terminal=false
+Type=Application
+Categories=Utility;AccessTools;
+Keywords=clicklume;autoclicker;clicker;automation;mouse;wayland;ubuntu;gnome;
+StartupNotify=true

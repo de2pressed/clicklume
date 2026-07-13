@@ -1,0 +1,43 @@
+# /etc/udev/rules.d/99-clicklume-keyboards.rules
+# Grants the active user RW access to /dev/input/eventN for keyboards so
+# clicklume-backend can read hotkeys from keyboard devices without needing root.
+#
+# Two mechanisms are applied:
+# 1. MODE="0660" GROUP="input" — gives the `input` group read/write access
+#    to the keyboard device file. User must be in `input` group.
+# 2. TAG+="uaccess" — logind may grant session-scoped access on systems
+#    that support it (Ubuntu 24.04 currently does NOT for input devices,
+#    but this is harmless and future-proofs the rule).
+#
+# Why two mechanisms?
+# -------------------
+# Ubuntu 24.04 / GNOME 46 does NOT honour TAG+="uaccess" for input devices
+# (see `gotchas/input-group-required-for-evdev-grab.md`). TAG-only leaves
+# `crw-rw---- root:input 0660` with no per-user ACL — opening the device
+# fails with EACCES for users not in `input`.
+#
+# MODE="0660" GROUP="input" fixes it for any user added to the `input`
+# group. `install.sh` does `sudo usermod -aG input "$USER"`. After the
+# next login the autoclicker gets RW access.
+#
+# Why we filter on ID_INPUT_KEYBOARD
+# ----------------------------------
+# We MUST limit this to real keyboards only. Granting group-rw on mice,
+# touchpads, gamepads, etc. would let any member of `input` (e.g. any
+# future accidental member) read those devices too. ID_INPUT_KEYBOARD is
+# set by the kernel via 60-input-id.rules based on EV_KEY capability and
+# absence of relative axes.
+#
+# Why we name ourselves "clicklume"
+# ---------------------------------
+# If you also run another tool that reads keyboards (e.g. a custom keylogger
+# for accessibility), put it BEFORE this rule so its TAG+="uaccess" wins,
+# or rename this rule to a higher number so it loads after the other.
+#
+# Install with:
+#   sudo cp 99-clicklume-keyboards.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --property --subsystem-match=input
+#
+# (clicklume's install.sh can do this for you with sudo.)
+SUBSYSTEM=="input", ENV{ID_INPUT_KEYBOARD}=="1", MODE="0660", GROUP="input", TAG+="uaccess"

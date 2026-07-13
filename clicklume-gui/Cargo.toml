@@ -1,0 +1,31 @@
+[package]
+name = "clicklume-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compact native autoclicker GUI for Ubuntu GNOME Wayland"
+
+[[bin]]
+name = "clicklume-gui"
+path = "src/main.rs"
+
+[dependencies]
+common = { package = "clicklume-common", path = "../clicklume-common" }
+
+# GUI framework
+eframe = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# Persistent state (serde + toml) — both already workspace deps, just exposed here
+serde = { workspace = true }
+toml = { workspace = true }
+
+# Logging
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# Signal handling (SIGTERM -> graceful Quit) — already a workspace dep
+libc = { workspace = true }

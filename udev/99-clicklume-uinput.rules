@@ -1,0 +1,15 @@
+# /etc/udev/rules.d/99-clicklume-uinput.rules
+# Grants the active user RW access to /dev/uinput so clicklume-backend
+# can create a virtual mouse without needing root.
+#
+# TAG+="uaccess" is the systemd-logind mechanism that grants access to the
+# currently-active local session user. We re-apply it independently of
+# Steam's rule (70-snap.steam.rules) so clicklume works without Steam.
+#
+# Install with:
+#   sudo cp 99-clicklume-uinput.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --name-match=uinput
+#
+# (clicklume's install.sh can do this for you with sudo.)
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
