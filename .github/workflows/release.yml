@@ -28,5 +28,5 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "ClickLume $GITHUB_REF_NAME — Ubuntu GNOME Wayland preview" \
-            --notes-file docs/RELEASE_NOTES_v0.1.0.md \
+            --generate-notes \
             --verify-tag
