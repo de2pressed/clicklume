@@ -24,7 +24,7 @@ nix = "0.27"
 libc = "0.2"
 
 # Configuration
-toml = "0.8"
+toml = "1.1"
 serde = { version = "1", features = ["derive"] }
 
 # Async runtime
