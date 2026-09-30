@@ -12,6 +12,8 @@
 
 use anyhow::{Context, Result};
 use evdev::{Device, KeyCode};
+use nix::poll::{poll, PollFd, PollFlags};
+use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,11 +96,47 @@ fn device_name_for(path: &Path) -> String {
     .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// A device is useful to us if the kernel says it can emit at least one of the
-/// configured hotkey keycodes. This avoids fragile sysfs KEY bitmap parsing and
-/// prevents false positives like Bluetooth mice, power buttons, sleep buttons,
-/// video bus devices, and headset AVRCP controls.
+fn is_excluded_device_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // Exclude pointer / mouse devices
+    lower.contains("mouse")
+        || lower.contains("touchpad")
+        || lower.contains("trackpoint")
+        || lower.contains("trackball")
+        // Exclude audio / consumer headsets
+        || lower.contains("avrcp")
+        || lower.contains("headset")
+        || lower.contains("audio")
+        // Exclude system switches / video bus
+        || lower.contains("power button")
+        || lower.contains("sleep button")
+        || lower.contains("lid switch")
+        || lower.contains("video bus")
+        // Exclude our own virtual device or other virtual mice
+        || lower.contains("clicklume")
+        || lower.contains("virtual")
+}
+
+/// A device is useful to us if:
+/// 1. It is not an excluded device type (mouse, touchpad, audio, virtual).
+/// 2. It is a genuine typing keyboard (supports KEY_A, KEY_ENTER, KEY_SPACE).
+/// 3. It can emit at least one of the configured hotkey keycodes.
 fn supports_any_hotkey(path: &Path, hotkeys: &[KeyCode; 4]) -> bool {
+    let name = device_name_for(path);
+
+    // 1. Zero-touch pre-filter: Do NOT open devices that are clearly mice, touchpads,
+    // headsets, system buttons, or virtual devices. This avoids device contention with
+    // game engines (e.g. Roblox / Sober) and audio stacks.
+    if is_excluded_device_name(&name) {
+        log::debug!(
+            "Skipping {} ({}) — excluded device type (mouse/touchpad/audio/virtual)",
+            path.display(),
+            name
+        );
+        return false;
+    }
+
+    // 2. Open device read-only to inspect capabilities
     let dev = match Device::open(path) {
         Ok(dev) => dev,
         Err(e) => {
@@ -115,17 +153,36 @@ fn supports_any_hotkey(path: &Path, hotkeys: &[KeyCode; 4]) -> bool {
         log::debug!(
             "Skipping {} ({}) — no EV_KEY capability",
             path.display(),
-            device_name_for(path)
+            name
         );
         return false;
     };
 
+    // 3. True Physical Keyboard Validation:
+    // A genuine typing keyboard MUST support basic alphanumeric and formatting keys
+    // such as KEY_A, KEY_ENTER, and KEY_SPACE.
+    // Mice with secondary multimedia endpoints, AVRCP headsets, and macro controls
+    // do NOT support these core keys.
+    let is_typing_keyboard = keys.contains(KeyCode::KEY_A)
+        && keys.contains(KeyCode::KEY_ENTER)
+        && keys.contains(KeyCode::KEY_SPACE);
+
+    if !is_typing_keyboard {
+        log::debug!(
+            "Skipping {} ({}) — lacks core keyboard keys (KEY_A / KEY_ENTER / KEY_SPACE)",
+            path.display(),
+            name
+        );
+        return false;
+    }
+
+    // 4. Check if the keyboard supports any of the configured hotkeys
     let supported = hotkeys.iter().any(|key| keys.contains(*key));
     if !supported {
         log::debug!(
             "Skipping {} ({}) — does not support configured hotkeys",
             path.display(),
-            device_name_for(path)
+            name
         );
     }
     supported
@@ -212,21 +269,88 @@ impl HotkeyReader {
             .name("clicklume-hotkey-monitor".into())
             .spawn(move || {
                 log::info!("Hotkey monitor thread started");
+
+                // Event-driven hotplug: watch /dev/input for newly created device nodes
+                let inotify = match Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK) {
+                    Ok(inotify) => {
+                        match inotify.add_watch("/dev/input", AddWatchFlags::IN_CREATE) {
+                            Ok(_) => {
+                                log::info!("Inotify watch active on /dev/input (event-driven hotplug)");
+                                Some(inotify)
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to add inotify watch on /dev/input: {}; falling back to slow poll",
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to initialize inotify: {}; falling back to slow poll",
+                            e
+                        );
+                        None
+                    }
+                };
+
                 while running.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_secs(2));
-                    let mut detached = Vec::new();
-                    rescan_and_spawn(
-                        &hotkeys,
-                        tx.clone(),
-                        running.clone(),
-                        active_paths.clone(),
-                        &mut detached,
-                    );
-                    // We intentionally detach hotplug reader handles here. They exit on
-                    // EOF/read error or process shutdown; keeping them in this monitor
-                    // stack would not buy us anything and would complicate ownership.
-                    for handle in detached {
-                        std::mem::forget(handle);
+                    if let Some(ref inotify) = inotify {
+                        let mut poll_fds = [PollFd::new(inotify, PollFlags::POLLIN)];
+                        match poll(&mut poll_fds, 1000) {
+                            Ok(n) if n > 0 => {
+                                if let Ok(events) = inotify.read_events() {
+                                    if !events.is_empty() {
+                                        log::debug!(
+                                            "Inotify detected {} new event(s) in /dev/input",
+                                            events.len()
+                                        );
+                                        // 300ms settling debounce so kernel drivers, BlueZ, and
+                                        // game engines (SDL2) finish binding before ClickLume probes
+                                        thread::sleep(Duration::from_millis(300));
+                                        let _ = inotify.read_events();
+
+                                        let mut detached = Vec::new();
+                                        rescan_and_spawn(
+                                            &hotkeys,
+                                            tx.clone(),
+                                            running.clone(),
+                                            active_paths.clone(),
+                                            &mut detached,
+                                        );
+                                        for handle in detached {
+                                            std::mem::forget(handle);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                // 1-second poll timeout: loop and re-check running.load()
+                                continue;
+                            }
+                            Err(e) => {
+                                if e != nix::errno::Errno::EINTR {
+                                    log::warn!("Inotify poll error: {}", e);
+                                    thread::sleep(Duration::from_secs(1));
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback slow poll if inotify is unavailable
+                        thread::sleep(Duration::from_secs(5));
+                        let mut detached = Vec::new();
+                        rescan_and_spawn(
+                            &hotkeys,
+                            tx.clone(),
+                            running.clone(),
+                            active_paths.clone(),
+                            &mut detached,
+                        );
+                        for handle in detached {
+                            std::mem::forget(handle);
+                        }
                     }
                 }
                 log::info!("Hotkey monitor thread stopped");
@@ -359,3 +483,52 @@ fn reader_thread(
         dev.name
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_excluded_devices() {
+        // Excluded: mice, touchpads, virtual devices, headsets, system buttons
+        assert!(is_excluded_device_name("Lenovo Bluetooth Mouse"));
+        assert!(is_excluded_device_name("Lenovo Bluetooth Mouse Keyboard"));
+        assert!(is_excluded_device_name("Evision USB DEVICE Mouse"));
+        assert!(is_excluded_device_name("ASUF1207:00 2808:0219 Touchpad"));
+        assert!(is_excluded_device_name("HBTS001 (AVRCP)"));
+        assert!(is_excluded_device_name("clicklume-virtual-mouse"));
+        assert!(is_excluded_device_name("Power Button"));
+        assert!(is_excluded_device_name("Sleep Button"));
+        assert!(is_excluded_device_name("Lid Switch"));
+        assert!(is_excluded_device_name("Video Bus"));
+
+        // Allowed: real physical and Bluetooth keyboards
+        assert!(!is_excluded_device_name("AT Translated Set 2 keyboard"));
+        assert!(!is_excluded_device_name("Evision USB DEVICE Keyboard"));
+        assert!(!is_excluded_device_name("Logitech MX Keys"));
+        assert!(!is_excluded_device_name("Keychron K2 Pro"));
+        assert!(!is_excluded_device_name("Apple Magic Keyboard"));
+    }
+
+    #[test]
+    fn test_live_keyboard_discovery_excludes_mice() {
+        let hotkeys = [
+            KeyCode::KEY_F6,
+            KeyCode::KEY_F7,
+            KeyCode::KEY_F8,
+            KeyCode::KEY_F9,
+        ];
+        let skip = HashSet::new();
+        let found = find_keyboard_devices_for_hotkeys(&hotkeys, &skip);
+        for p in &found {
+            let name = device_name_for(p);
+            println!("Discovered valid keyboard: {} ({})", p.display(), name);
+            assert!(
+                !is_excluded_device_name(&name),
+                "Excluded device should not be discovered: {}",
+                name
+            );
+        }
+    }
+}
+
