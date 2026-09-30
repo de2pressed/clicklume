@@ -95,6 +95,11 @@ systemctl --user daemon-reload
 systemctl --user disable clicklume.service >/dev/null 2>&1 || true
 # Prevent the pre-rename service from launching a second copy after upgrade.
 systemctl --user disable --now autoclick-gui.service >/dev/null 2>&1 || true
+# Clean up legacy GNOME Shell extension if present (prevents F6/F9 hijacking)
+if command -v gnome-extensions >/dev/null 2>&1; then
+    gnome-extensions disable autoclick-hotkeys@jayant.github.com >/dev/null 2>&1 || true
+fi
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/autoclick-hotkeys@jayant.github.com"
 
 if [ "$SKIP_SYSTEM_SETUP" -eq 0 ]; then
     step "Configure Wayland input access"

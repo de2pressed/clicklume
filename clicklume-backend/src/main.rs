@@ -18,6 +18,7 @@ use std::time::Duration;
 
 // Socket path for communication
 const SOCKET_PATH: &str = "/tmp/clicklume.sock";
+const LEGACY_SOCKET_PATH: &str = "/tmp/autoclick.sock";
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -171,8 +172,9 @@ fn main() -> Result<()> {
         }
     });
 
-    // Remove existing socket file
+    // Remove existing socket files
     let _ = std::fs::remove_file(SOCKET_PATH);
+    let _ = std::fs::remove_file(LEGACY_SOCKET_PATH);
 
     // Create Unix socket listener
     let socket_listener = UnixListener::bind(SOCKET_PATH)?;
@@ -184,6 +186,9 @@ fn main() -> Result<()> {
         SOCKET_PATH,
         std::os::unix::fs::PermissionsExt::from_mode(0o666),
     )?;
+
+    // Create legacy symlink for backward compatibility with existing tools / GNOME extensions
+    let _ = std::os::unix::fs::symlink(SOCKET_PATH, LEGACY_SOCKET_PATH);
 
     // Shared slot for the long-lived GUI notification socket. Cleared by the
     // listener holder thread on EOF so a dead socket never blocks backend
@@ -249,8 +254,9 @@ fn main() -> Result<()> {
     log::info!("Shutting down...");
     clicker.stop();
 
-    // Remove socket file
+    // Remove socket files
     let _ = std::fs::remove_file(SOCKET_PATH);
+    let _ = std::fs::remove_file(LEGACY_SOCKET_PATH);
 
     Ok(())
 }

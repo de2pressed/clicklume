@@ -187,29 +187,34 @@ impl Clicker {
 
     /// Perform one click "event" (single press, double press, or hold) for
     /// the current mode. Returns true if any button events were emitted.
-    fn emit_click_event(&self, device: &mut VirtualDevice, btn_code: KeyCode) -> Result<()> {
+    fn emit_click_event(&self, device: &mut VirtualDevice, btn_code: KeyCode, interval: Duration) -> Result<()> {
         let mode = *self.state.mode.lock().unwrap();
         match mode {
             ClickMode::Single => {
+                // Ensure a realistic hold duration. In Linux/Wayland (libinput),
+                // button presses held for <10ms trigger the hardware debounce filter
+                // (DEBOUNCE_TIMEOUT_BOUNCE), causing the release to be suppressed and locking
+                // the mouse button in the down state.
+                let hold = (interval / 2).clamp(Duration::from_millis(5), Duration::from_millis(25));
                 Self::send_button_event(device, btn_code, true)?;
-                thread::sleep(Duration::from_micros(100));
+                thread::sleep(hold);
                 Self::send_button_event(device, btn_code, false)?;
             }
             ClickMode::Double => {
+                let hold = (interval / 4).clamp(Duration::from_millis(5), Duration::from_millis(20));
                 Self::send_button_event(device, btn_code, true)?;
-                thread::sleep(Duration::from_micros(80));
+                thread::sleep(hold);
                 Self::send_button_event(device, btn_code, false)?;
-                thread::sleep(Duration::from_millis(35));
+                thread::sleep(Duration::from_millis(25));
                 Self::send_button_event(device, btn_code, true)?;
-                thread::sleep(Duration::from_micros(80));
+                thread::sleep(hold);
                 Self::send_button_event(device, btn_code, false)?;
             }
             ClickMode::Hold => {
                 // Press and release over the full interval — sustained
                 // press for half the interval, release for the second half
                 Self::send_button_event(device, btn_code, true)?;
-                let cps = self.state.cps.load(Ordering::Relaxed).max(1);
-                let hold = Duration::from_millis(500_u64.saturating_div(cps as u64));
+                let hold = interval / 2;
                 thread::sleep(hold);
                 Self::send_button_event(device, btn_code, false)?;
             }
@@ -277,7 +282,7 @@ impl Clicker {
                 let interval = clicker.next_interval();
                 let start = std::time::Instant::now();
 
-                if let Err(e) = clicker.emit_click_event(&mut device, btn_code) {
+                if let Err(e) = clicker.emit_click_event(&mut device, btn_code, interval) {
                     log::debug!("Click emission failed: {}", e);
                 }
 

@@ -79,12 +79,12 @@ fn click_interval(ui: &mut egui::Ui, app: &mut App, p: Palette) {
         let mut cps = app.cps;
         let slider = ui.add_sized(
             [300.0, 30.0],
-            egui::Slider::new(&mut cps, 1..=1000).show_value(false),
+            egui::Slider::new(&mut cps, 1..=100).show_value(false),
         );
         let value = ui.add_sized(
             [92.0, 30.0],
             egui::DragValue::new(&mut cps)
-                .range(1..=1000)
+                .range(1..=100)
                 .speed(1.0)
                 .suffix(" CPS"),
         );

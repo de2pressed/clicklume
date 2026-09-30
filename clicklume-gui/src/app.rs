@@ -534,7 +534,7 @@ impl App {
 
         let mut app = Self {
             enabled: false,
-            cps: persistent.cps.clamp(1, 1000),
+            cps: persistent.cps.clamp(1, 100),
             button: persistent.button.clone(),
             mode: persistent.mode.clone(),
             randomize: persistent.randomize,
@@ -621,7 +621,7 @@ impl App {
             }
             "increase" => {
                 self.hotkey_action_pending = Some(Instant::now());
-                self.set_cps(self.cps.saturating_add(Self::cps_step(self.cps)).min(1000));
+                self.set_cps(self.cps.saturating_add(Self::cps_step(self.cps)).min(100));
             }
             "decrease" => {
                 self.hotkey_action_pending = Some(Instant::now());
@@ -822,7 +822,7 @@ impl App {
     }
 
     pub fn set_cps(&mut self, v: u32) {
-        let v = v.clamp(1, 1000);
+        let v = v.clamp(1, 100);
         if v == self.cps {
             return;
         }

@@ -11,9 +11,8 @@
 //! evdev lets both GNOME/libinput and this backend receive the same events.
 
 use anyhow::{Context, Result};
-use evdev::{Device, InputEvent, KeyCode};
+use evdev::{Device, KeyCode};
 use std::collections::HashSet;
-use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -177,23 +176,6 @@ impl WatchedDevice {
         log::info!("Watching hotkeys on {} ({})", path.display(), name);
         Ok(Self { dev, path, name })
     }
-
-    fn read_event(&self) -> Result<Option<InputEvent>> {
-        let mut buf = [0u8; 24];
-        let raw = self.dev.as_fd().as_raw_fd();
-        match nix::unistd::read(raw, &mut buf) {
-            Ok(0) => Ok(None),
-            Ok(n) if n >= 24 => {
-                let type_ = u16::from_ne_bytes(buf[16..18].try_into().unwrap());
-                let code = u16::from_ne_bytes(buf[18..20].try_into().unwrap());
-                let value = i32::from_ne_bytes(buf[20..24].try_into().unwrap());
-                Ok(Some(InputEvent::new_now(type_, code, value)))
-            }
-            Ok(_) => Ok(None),
-            Err(nix::Error::EINTR) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("read failed: {}", e)),
-        }
-    }
 }
 
 pub struct HotkeyReader {
@@ -323,7 +305,7 @@ fn rescan_and_spawn(
 }
 
 fn reader_thread(
-    dev: WatchedDevice,
+    mut dev: WatchedDevice,
     tx: Sender<HotkeyAction>,
     running: Arc<AtomicBool>,
     hotkeys: [KeyCode; 4],
@@ -334,35 +316,31 @@ fn reader_thread(
         dev.name
     );
     while running.load(Ordering::Relaxed) {
-        match dev.read_event() {
-            Ok(Some(event)) => {
-                // EV_KEY == 1; value 1 == initial press. Ignore release(0) and repeat(2).
-                if event.event_type().0 != 1 || event.value() != 1 {
-                    continue;
-                }
-                let code = KeyCode(event.code());
-                if let Some(action) =
-                    keycode_to_action(code, hotkeys[0], hotkeys[1], hotkeys[2], hotkeys[3])
-                {
-                    log::info!(
-                        "Hotkey action {:?} from {} ({})",
-                        action,
-                        dev.path.display(),
-                        dev.name
-                    );
-                    if tx.send(action).is_err() {
-                        log::warn!("Hotkey receiver dropped; exiting reader thread");
-                        return;
+        match dev.dev.fetch_events() {
+            Ok(events) => {
+                for event in events {
+                    // EV_KEY == 1; value 1 == initial press. Ignore release(0) and repeat(2).
+                    if event.event_type().0 == 1 && event.value() == 1 {
+                        let code = KeyCode(event.code());
+                        if let Some(action) =
+                            keycode_to_action(code, hotkeys[0], hotkeys[1], hotkeys[2], hotkeys[3])
+                        {
+                            log::info!(
+                                "Hotkey action {:?} from {} ({})",
+                                action,
+                                dev.path.display(),
+                                dev.name
+                            );
+                            if tx.send(action).is_err() {
+                                log::warn!("Hotkey receiver dropped; exiting reader thread");
+                                return;
+                            }
+                        }
                     }
                 }
             }
-            Ok(None) => {
-                log::info!(
-                    "EOF/short read on {} ({}); reader exiting",
-                    dev.path.display(),
-                    dev.name
-                );
-                return;
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(e) => {
                 log::warn!(
