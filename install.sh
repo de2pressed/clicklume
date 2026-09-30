@@ -81,9 +81,13 @@ ln -sfn "$INSTALL_DIR/clicklume-cli" "$BIN_DIR/autoclick-cli"
 
 step "Install desktop launcher and optional user service"
 mkdir -p "$DESKTOP_DIR" "$SERVICE_DIR"
+rm -f "$DESKTOP_DIR/autoclick.desktop"
 sed "s|@GUI_BIN@|$INSTALL_DIR/clicklume-gui|g" \
     "$PROJECT_DIR/clicklume.desktop" > "$DESKTOP_DIR/clicklume.desktop"
 chmod 0644 "$DESKTOP_DIR/clicklume.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+fi
 sed "s|@GUI_BIN@|$INSTALL_DIR/clicklume-gui|g" \
     "$PROJECT_DIR/systemd/clicklume.service" > "$SERVICE_DIR/clicklume.service"
 chmod 0644 "$SERVICE_DIR/clicklume.service"

@@ -11,7 +11,8 @@ const SOCKET_PATH: &str = "/tmp/clicklume.sock";
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: clicklume-cli <toggle|inc|dec|start|stop|quit>");
+        eprintln!("usage: clicklume-cli <status|toggle|inc|dec|start|stop|quit>");
+        eprintln!("  status  — get current status");
         eprintln!("  toggle  — flip enabled state");
         eprintln!("  inc     — increase CPS");
         eprintln!("  dec     — decrease CPS");
@@ -23,6 +24,7 @@ fn main() {
 
     // Map CLI arg to GuiToBackend variant
     let msg = match arg.as_str() {
+        "status" => GuiToBackend::GetStatus,
         "toggle" => GuiToBackend::Toggle,
         "inc" => GuiToBackend::IncreaseCps,
         "dec" => GuiToBackend::DecreaseCps,
@@ -35,20 +37,15 @@ fn main() {
         }
     };
 
-    // Verify the backend is actually listening (not just that a stale socket
-    // file exists). If the socket file is stale (left over from a crash),
-    // remove it so the GUI's next auto-respawn can rebind cleanly.
-    if UnixStream::connect(SOCKET_PATH).is_err() {
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        eprintln!("clicklume backend not running (cannot connect to {SOCKET_PATH})");
-        std::process::exit(3);
-    }
-
+    // Connect to the backend socket. If the socket file is stale (left over
+    // from a crash or killed backend), remove it so subsequent auto-respawns
+    // can rebind cleanly.
     let mut stream = match UnixStream::connect(SOCKET_PATH) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("failed to connect to {SOCKET_PATH}: {e}");
-            std::process::exit(4);
+            let _ = std::fs::remove_file(SOCKET_PATH);
+            eprintln!("clicklume backend not running (cannot connect to {SOCKET_PATH}): {e}");
+            std::process::exit(3);
         }
     };
 

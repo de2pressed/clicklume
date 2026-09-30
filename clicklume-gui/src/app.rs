@@ -65,6 +65,26 @@ impl Default for HotkeySettings {
     }
 }
 
+fn parse_egui_key(name: &str) -> Option<egui::Key> {
+    let normalized = name.trim().to_uppercase();
+    let stripped = normalized.strip_prefix("KEY_").unwrap_or(&normalized);
+    match stripped {
+        "F1" => Some(egui::Key::F1),
+        "F2" => Some(egui::Key::F2),
+        "F3" => Some(egui::Key::F3),
+        "F4" => Some(egui::Key::F4),
+        "F5" => Some(egui::Key::F5),
+        "F6" => Some(egui::Key::F6),
+        "F7" => Some(egui::Key::F7),
+        "F8" => Some(egui::Key::F8),
+        "F9" => Some(egui::Key::F9),
+        "F10" => Some(egui::Key::F10),
+        "F11" => Some(egui::Key::F11),
+        "F12" => Some(egui::Key::F12),
+        _ => None,
+    }
+}
+
 fn config_path() -> std::path::PathBuf {
     config_dir().join("config.toml")
 }
@@ -373,6 +393,7 @@ fn listen_for_notifications(
                                             mode,
                                             randomize,
                                             jitter_ms,
+                                            repeat_count,
                                             ..
                                         } => state::merge_backend_settings(
                                             *cps,
@@ -380,6 +401,7 @@ fn listen_for_notifications(
                                             mode.clone(),
                                             *randomize,
                                             *jitter_ms,
+                                            *repeat_count,
                                         ),
                                         _ => {}
                                     }
@@ -466,6 +488,10 @@ pub struct App {
 
     cps_last_change: Option<Instant>,
     cps_last_sent: u32,
+    jitter_last_change: Option<Instant>,
+    jitter_last_sent: u32,
+    repeat_last_change: Option<Instant>,
+    repeat_last_sent: u32,
 
     /// Set once the user or the global quit hotkey requests application
     /// shutdown. This prevents the lifecycle poll from treating the expected
@@ -528,10 +554,14 @@ impl App {
             backend_pid,
             shutting_down,
             last_socket_check: Instant::now(),
-            persistent,
+            persistent: persistent.clone(),
             save_tx,
             cps_last_change: None,
             cps_last_sent: 0,
+            jitter_last_change: None,
+            jitter_last_sent: persistent.jitter_ms,
+            repeat_last_change: None,
+            repeat_last_sent: persistent.repeat_count,
             shutdown_requested: false,
             hotkey_action_pending: None,
         };
@@ -603,7 +633,7 @@ impl App {
         }
     }
 
-    fn flush_pending_cps(&mut self) {
+    fn flush_pending_settings(&mut self) {
         if let Some(t) = self.cps_last_change {
             if t.elapsed() >= CPS_DEBOUNCE
                 && self.cps != self.cps_last_sent
@@ -611,6 +641,27 @@ impl App {
             {
                 self.cps_last_sent = self.cps;
                 self.cps_last_change = None;
+            }
+        }
+        if let Some(t) = self.jitter_last_change {
+            if t.elapsed() >= CPS_DEBOUNCE
+                && self.jitter_ms != self.jitter_last_sent
+                && self.send_command(GuiToBackend::SetJitterMs(self.jitter_ms), "set jitter")
+            {
+                self.jitter_last_sent = self.jitter_ms;
+                self.jitter_last_change = None;
+            }
+        }
+        if let Some(t) = self.repeat_last_change {
+            if t.elapsed() >= CPS_DEBOUNCE
+                && self.repeat_count != self.repeat_last_sent
+                && self.send_command(
+                    GuiToBackend::SetRepeatCount(self.repeat_count),
+                    "set repeat count",
+                )
+            {
+                self.repeat_last_sent = self.repeat_count;
+                self.repeat_last_change = None;
             }
         }
     }
@@ -655,6 +706,10 @@ impl App {
         }
         self.cps_last_sent = self.cps;
         self.cps_last_change = None;
+        self.jitter_last_sent = self.jitter_ms;
+        self.jitter_last_change = None;
+        self.repeat_last_sent = self.repeat_count;
+        self.repeat_last_change = None;
     }
 
     fn spawn_backend(&mut self) {
@@ -817,13 +872,9 @@ impl App {
         if v == self.jitter_ms {
             return;
         }
-        let previous = self.jitter_ms;
         self.jitter_ms = v;
-        if self.send_command(GuiToBackend::SetJitterMs(v), "set jitter") {
-            self.save_persistent();
-        } else {
-            self.jitter_ms = previous;
-        }
+        self.jitter_last_change = Some(Instant::now());
+        self.save_persistent();
     }
 
     pub fn set_repeat_count(&mut self, count: u32) {
@@ -831,13 +882,9 @@ impl App {
         if count == self.repeat_count {
             return;
         }
-        let previous = self.repeat_count;
         self.repeat_count = count;
-        if self.send_command(GuiToBackend::SetRepeatCount(count), "set repeat count") {
-            self.save_persistent();
-        } else {
-            self.repeat_count = previous;
-        }
+        self.repeat_last_change = Some(Instant::now());
+        self.save_persistent();
     }
 
     pub fn set_autostart(&mut self, on: bool) {
@@ -868,7 +915,7 @@ impl App {
         self.show_hotkey_settings = false;
     }
 
-    pub fn apply_hotkey_settings(&mut self) {
+    pub fn apply_hotkey_settings(&mut self) -> bool {
         let values = [
             &self.hotkey_draft.toggle,
             &self.hotkey_draft.increase,
@@ -877,12 +924,12 @@ impl App {
         ];
         if (0..values.len()).any(|i| ((i + 1)..values.len()).any(|j| values[i] == values[j])) {
             self.last_error = Some("Each action needs a different F-key.".to_string());
-            return;
+            return false;
         }
 
         if let Err(e) = save_hotkeys(&self.hotkey_draft) {
             self.last_error = Some(format!("Could not save hotkeys: {}", e));
-            return;
+            return false;
         }
 
         self.hotkeys = self.hotkey_draft.clone();
@@ -925,7 +972,7 @@ impl App {
                 "The backend did not stop in time; hotkeys will apply after the next restart."
                     .to_string(),
             );
-            return;
+            return false;
         }
 
         self.backend_present = false;
@@ -937,6 +984,7 @@ impl App {
         if self.backend_present {
             self.sync_backend_settings();
         }
+        true
     }
 }
 
@@ -1063,22 +1111,25 @@ impl eframe::App for App {
                     mode,
                     randomize,
                     jitter_ms,
+                    repeat_count,
                 } => {
                     log::info!(
-                        "GUI received Status: enabled={} cps={} button={} mode={} randomize={} jitter_ms={}",
-                        enabled, cps, button, mode, randomize, jitter_ms
+                        "GUI received Status: enabled={} cps={} button={} mode={} randomize={} jitter_ms={} repeat_count={}",
+                        enabled, cps, button, mode, randomize, jitter_ms, repeat_count
                     );
                     let settings_changed = self.cps != cps
                         || self.button != button
                         || self.mode != mode
                         || self.randomize != randomize
-                        || self.jitter_ms != jitter_ms;
+                        || self.jitter_ms != jitter_ms
+                        || self.repeat_count != repeat_count;
                     self.enabled = enabled;
                     self.cps = cps;
                     self.button = button;
                     self.mode = mode;
                     self.randomize = randomize;
                     self.jitter_ms = jitter_ms;
+                    self.repeat_count = repeat_count;
                     if settings_changed {
                         // Backend-owned global hotkeys bypass the GUI setters,
                         // so persist the resulting status here as well.
@@ -1108,8 +1159,8 @@ impl eframe::App for App {
             return;
         }
 
-        // Flush debounced CPS update if deadline passed.
-        self.flush_pending_cps();
+        // Flush debounced settings update if deadline passed.
+        self.flush_pending_settings();
 
         // Window-focused fallback hotkeys (work even when the in-process evdev
         // reader is unavailable, e.g. when the user is not in the `input`
@@ -1121,19 +1172,29 @@ impl eframe::App for App {
             .map(|t| t.elapsed() < Duration::from_millis(600))
             .unwrap_or(false);
 
-        if !backend_hotkey_recent && ctx.input(|i| i.key_pressed(egui::Key::F6)) {
-            self.handle_hotkey("toggle");
-        }
-        if !backend_hotkey_recent && ctx.input(|i| i.key_pressed(egui::Key::F7)) {
-            self.handle_hotkey("increase");
-        }
-        if !backend_hotkey_recent && ctx.input(|i| i.key_pressed(egui::Key::F8)) {
-            self.handle_hotkey("decrease");
-        }
-        if !backend_hotkey_recent && ctx.input(|i| i.key_pressed(egui::Key::F9)) {
-            self.handle_hotkey("quit");
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
+        if !backend_hotkey_recent {
+            if let Some(key) = parse_egui_key(&self.hotkeys.toggle) {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    self.handle_hotkey("toggle");
+                }
+            }
+            if let Some(key) = parse_egui_key(&self.hotkeys.increase) {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    self.handle_hotkey("increase");
+                }
+            }
+            if let Some(key) = parse_egui_key(&self.hotkeys.decrease) {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    self.handle_hotkey("decrease");
+                }
+            }
+            if let Some(key) = parse_egui_key(&self.hotkeys.quit) {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    self.handle_hotkey("quit");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+            }
         }
 
         ctx.request_repaint_after(Duration::from_millis(500));

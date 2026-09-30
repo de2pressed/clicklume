@@ -83,6 +83,7 @@ impl ClickerState {
 pub struct Clicker {
     state: ClickerState,
     running: Arc<AtomicBool>,
+    on_auto_stop: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Clicker {
@@ -91,7 +92,14 @@ impl Clicker {
         Self {
             state,
             running: Arc::new(AtomicBool::new(true)),
+            on_auto_stop: None,
         }
+    }
+
+    /// Attach a callback that fires when repeat count reaches its limit and autoclicking stops
+    pub fn with_auto_stop_callback(mut self, cb: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.on_auto_stop = Some(cb);
+        self
     }
 
     /// Get the KeyCode for a button name
@@ -191,7 +199,7 @@ impl Clicker {
                 Self::send_button_event(device, btn_code, true)?;
                 thread::sleep(Duration::from_micros(80));
                 Self::send_button_event(device, btn_code, false)?;
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(35));
                 Self::send_button_event(device, btn_code, true)?;
                 thread::sleep(Duration::from_micros(80));
                 Self::send_button_event(device, btn_code, false)?;
@@ -219,6 +227,7 @@ impl Clicker {
         let randomize = self.state.randomize.clone();
         let jitter_ms = self.state.jitter_ms.clone();
         let repeat_count = self.state.repeat_count.clone();
+        let on_auto_stop = self.on_auto_stop.clone();
 
         thread::spawn(move || {
             log::info!("Click worker thread started");
@@ -243,11 +252,15 @@ impl Clicker {
 
             let mut completed_actions = 0u32;
             let mut was_enabled = false;
+            let mut last_btn_code = KeyCode::BTN_LEFT;
 
             while running.load(Ordering::Relaxed) {
                 if !enabled.load(Ordering::Relaxed) {
-                    completed_actions = 0;
-                    was_enabled = false;
+                    if was_enabled {
+                        let _ = Self::send_button_event(&mut device, last_btn_code, false);
+                        completed_actions = 0;
+                        was_enabled = false;
+                    }
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -259,6 +272,7 @@ impl Clicker {
 
                 let current_button = button.lock().unwrap().clone();
                 let btn_code = Self::get_button_code(&current_button);
+                last_btn_code = btn_code;
 
                 let interval = clicker.next_interval();
                 let start = std::time::Instant::now();
@@ -270,9 +284,10 @@ impl Clicker {
                 let elapsed = start.elapsed();
                 if elapsed < interval {
                     let remaining = interval - elapsed;
-                    if remaining.as_millis() > 0 {
-                        thread::sleep(remaining);
-                    } else {
+                    if remaining >= Duration::from_millis(2) {
+                        thread::sleep(remaining - Duration::from_millis(1));
+                    }
+                    while start.elapsed() < interval {
                         std::hint::spin_loop();
                     }
                 }
@@ -283,8 +298,16 @@ impl Clicker {
                     if completed_actions >= limit {
                         enabled.store(false, Ordering::Relaxed);
                         was_enabled = false;
+                        let _ = Self::send_button_event(&mut device, btn_code, false);
+                        if let Some(ref cb) = on_auto_stop {
+                            cb();
+                        }
                     }
                 }
+            }
+
+            if was_enabled {
+                let _ = Self::send_button_event(&mut device, last_btn_code, false);
             }
 
             log::info!("Click worker thread terminated");

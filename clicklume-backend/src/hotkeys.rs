@@ -59,6 +59,10 @@ pub fn parse_keycode(name: &str) -> Option<KeyCode> {
                 // Linux input-event-codes.h: KEY_F1=59, KEY_F2=60, ..., KEY_F12=70.
                 let code = 58 + n as u16;
                 return Some(KeyCode(code));
+            } else if (13..=24).contains(&n) {
+                // Linux input-event-codes.h: KEY_F13=183, ..., KEY_F24=194.
+                let code = 183 + (n - 13) as u16;
+                return Some(KeyCode(code));
             }
         }
     }
@@ -128,7 +132,10 @@ fn supports_any_hotkey(path: &Path, hotkeys: &[KeyCode; 4]) -> bool {
     supported
 }
 
-pub fn find_keyboard_devices_for_hotkeys(hotkeys: &[KeyCode; 4]) -> Vec<PathBuf> {
+pub fn find_keyboard_devices_for_hotkeys(
+    hotkeys: &[KeyCode; 4],
+    skip_paths: &HashSet<PathBuf>,
+) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir("/dev/input") {
         Ok(entries) => entries,
         Err(e) => {
@@ -141,15 +148,18 @@ pub fn find_keyboard_devices_for_hotkeys(hotkeys: &[KeyCode; 4]) -> Vec<PathBuf>
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| is_event_node(path))
+        .filter(|path| !skip_paths.contains(path))
         .filter(|path| supports_any_hotkey(path, hotkeys))
         .collect();
 
     found.sort_by_key(|p| event_node_sort_key(p));
     found.dedup();
 
-    log::info!("Discovered {} hotkey-capable input device(s):", found.len());
-    for p in &found {
-        log::info!("  {} ({})", p.display(), device_name_for(p));
+    if !found.is_empty() {
+        log::info!("Discovered {} new hotkey-capable input device(s):", found.len());
+        for p in &found {
+            log::info!("  {} ({})", p.display(), device_name_for(p));
+        }
     }
     found
 }
@@ -264,9 +274,12 @@ fn rescan_and_spawn(
     active_paths: Arc<Mutex<HashSet<PathBuf>>>,
     handles: &mut Vec<thread::JoinHandle<()>>,
 ) {
-    let devices = find_keyboard_devices_for_hotkeys(hotkeys);
+    let currently_active = active_paths.lock().unwrap().clone();
+    let devices = find_keyboard_devices_for_hotkeys(hotkeys, &currently_active);
     if devices.is_empty() {
-        log::warn!("No hotkey-capable keyboard devices found. Hotkeys disabled until one appears.");
+        if currently_active.is_empty() {
+            log::warn!("No hotkey-capable keyboard devices found. Hotkeys disabled until one appears.");
+        }
         return;
     }
 

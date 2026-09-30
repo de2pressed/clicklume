@@ -182,11 +182,12 @@ fn click_repeat(ui: &mut egui::Ui, app: &mut App, p: Palette) {
             app.set_repeat_count(count);
         }
     });
+    let toggle_key = hotkey_name(&app.hotkeys.toggle);
     ui.label(caption(
         if fixed {
-            "Stops at the limit."
+            "Stops at the limit.".to_string()
         } else {
-            "Stop with F6."
+            format!("Stop with {}.", toggle_key)
         },
         p,
     ));
@@ -233,10 +234,13 @@ fn action_button(
 }
 
 fn action_bar(ui: &mut egui::Ui, app: &mut App, p: Palette) {
+    let toggle_key = hotkey_name(&app.hotkeys.toggle);
+    let start_text = format!("Start   {}", toggle_key);
+    let stop_text = format!("Stop   {}", toggle_key);
     ui.horizontal(|ui| {
         if action_button(
             ui,
-            "Start   F6",
+            &start_text,
             !app.enabled,
             p.primary,
             p.on_primary,
@@ -248,7 +252,7 @@ fn action_bar(ui: &mut egui::Ui, app: &mut App, p: Palette) {
         }
         if action_button(
             ui,
-            "Stop   F6",
+            &stop_text,
             app.enabled,
             Color32::TRANSPARENT,
             p.text,
@@ -279,8 +283,14 @@ fn footer(ui: &mut egui::Ui, app: &mut App, p: Palette) {
         if ui.checkbox(&mut autostart, "Start on login").changed() {
             app.set_autostart(autostart);
         }
+        let inc_key = hotkey_name(&app.hotkeys.increase);
+        let dec_key = hotkey_name(&app.hotkeys.decrease);
+        let quit_key = hotkey_name(&app.hotkeys.quit);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(caption("F7 faster  ·  F8 slower  ·  F9 quit", p));
+            ui.label(caption(
+                format!("{} faster  ·  {} slower  ·  {} quit", inc_key, dec_key, quit_key),
+                p,
+            ));
         });
     });
 }
@@ -337,8 +347,7 @@ fn hotkey_settings_window(app: &mut App, ctx: &egui::Context, p: Palette) {
             hotkey_picker(ui, "hotkey_quit", "Quit", &mut app.hotkey_draft.quit);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Apply").clicked() {
-                    app.apply_hotkey_settings();
+                if ui.button("Apply").clicked() && app.apply_hotkey_settings() {
                     close_requested = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -346,6 +355,14 @@ fn hotkey_settings_window(app: &mut App, ctx: &egui::Context, p: Palette) {
                     close_requested = true;
                 }
             });
+            if let Some(ref err) = app.last_error {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(err)
+                        .font(theme::caption_font())
+                        .color(p.text),
+                );
+            }
         });
     if close_requested {
         open = false;

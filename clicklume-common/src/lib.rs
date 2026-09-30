@@ -27,6 +27,8 @@ pub enum GuiToBackend {
     SetJitterMs(u32),
     /// Set the number of click actions before stopping. Zero means unlimited.
     SetRepeatCount(u32),
+    /// Query current status without mutating state
+    GetStatus,
     /// Register this socket as the long-lived GUI notification listener.
     /// The backend keeps the connection open and pushes BackendToGui messages.
     SubscribeGui,
@@ -45,6 +47,8 @@ pub enum BackendToGui {
         mode: String,
         randomize: bool,
         jitter_ms: u32,
+        #[serde(default)]
+        repeat_count: u32,
     },
     /// Hotkey was pressed (for GUI to update its state)
     HotkeyPressed(String),
@@ -76,6 +80,7 @@ mod tests {
             mode: "double".into(),
             randomize: true,
             jitter_ms: 9,
+            repeat_count: 50,
         };
         let json = serde_json::to_string(&status).expect("status should serialize");
         let decoded: BackendToGui = serde_json::from_str(&json).expect("status should deserialize");
@@ -88,6 +93,7 @@ mod tests {
                 ref mode,
                 randomize: true,
                 jitter_ms: 9,
+                repeat_count: 50,
             } if button == "middle" && mode == "double"
         ));
     }

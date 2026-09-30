@@ -64,7 +64,13 @@ fn main() -> Result<()> {
     let gui_stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
 
     // Create and start clicker
-    let clicker = clicker::Clicker::new(clicker_state.clone());
+    let auto_stop_state = clicker_state.clone();
+    let auto_stop_gui_stream = gui_stream.clone();
+    let clicker = clicker::Clicker::new(clicker_state.clone()).with_auto_stop_callback(Arc::new(
+        move || {
+            send_status_from_state_to_gui(&auto_stop_gui_stream, &auto_stop_state);
+        },
+    ));
     clicker.start();
 
     // Start the in-process hotkey reader (replaces gsd-media-keys). The reader
@@ -190,13 +196,7 @@ fn main() -> Result<()> {
         match socket_listener.accept() {
             Ok((mut stream, _addr)) => {
                 log::info!("Connection received");
-                let enabled = enabled.clone();
-                let cps = cps.clone();
-                let button = button.clone();
-                let mode = mode.clone();
-                let randomize = randomize.clone();
-                let jitter_ms = jitter_ms.clone();
-                let repeat_count = repeat_count.clone();
+                let clicker_state_clone = clicker_state.clone();
                 let gui_stream_clone = gui_stream.clone();
                 let shutdown_clone = shutdown.clone();
                 std::thread::spawn(move || {
@@ -222,21 +222,10 @@ fn main() -> Result<()> {
                             log::warn!("Connection probe read failed: {}", e);
                         }
                         Ok(n) => {
-                            // Data arrived — parse as command. First, rewrite
-                            // the buffer so handle_connection can re-read it
-                            // (we already consumed the bytes via read above).
-                            // Simpler: call a variant that accepts the pre-read
-                            // buffer directly.
                             if let Err(e) = handle_connection_with_buffer(
                                 &stream,
                                 &buf[..n],
-                                &enabled,
-                                &cps,
-                                &button,
-                                &mode,
-                                &randomize,
-                                &jitter_ms,
-                                &repeat_count,
+                                &clicker_state_clone,
                                 gui_stream_clone,
                                 &shutdown_clone,
                             ) {
@@ -290,6 +279,7 @@ fn send_status_from_state_to_gui(
         mode: state.mode.lock().unwrap().as_str().to_string(),
         randomize: state.randomize.load(Ordering::Relaxed),
         jitter_ms: state.jitter_ms.load(Ordering::Relaxed),
+        repeat_count: state.repeat_count.load(Ordering::Relaxed),
     };
     match serde_json::to_vec(&msg) {
         Ok(mut json) => {
@@ -327,59 +317,17 @@ fn send_status_from_state_to_gui(
     }
 }
 
-/// Status push that includes mode/randomize/jitter. Used by SetMode /
-/// SetRandomize / SetJitterMs handlers so the GUI's persistent state stays
-/// in sync after every change.
-#[allow(clippy::too_many_arguments)]
-fn send_status_full_to_gui(
-    gui_stream: &Arc<Mutex<Option<UnixStream>>>,
-    enabled: &Arc<AtomicBool>,
-    cps: &Arc<AtomicU32>,
-    button: &Arc<Mutex<String>>,
-    mode: &Arc<Mutex<ClickMode>>,
-    randomize: &Arc<AtomicBool>,
-    jitter_ms: &Arc<AtomicU32>,
-) {
-    let msg = BackendToGui::Status {
-        enabled: enabled.load(Ordering::Relaxed),
-        cps: cps.load(Ordering::Relaxed),
-        button: button.lock().unwrap().clone(),
-        mode: mode.lock().unwrap().as_str().to_string(),
-        randomize: randomize.load(Ordering::Relaxed),
-        jitter_ms: jitter_ms.load(Ordering::Relaxed),
-    };
-    match serde_json::to_vec(&msg) {
-        Ok(mut json) => {
-            json.push(b'\n');
-            if let Ok(mut guard) = gui_stream.lock() {
-                if let Some(ref mut stream) = *guard {
-                    let _ = stream.write_all(&json);
-                }
-            }
-        }
-        Err(e) => log::error!("Failed to serialize full Status: {}", e),
-    }
-}
-
-/// Same as `send_status_full_to_gui` but writes to the requester's stream
+/// Same as `send_status_from_state_to_gui` but writes to the requester's stream
 /// and returns a Result so the IPC handler can propagate errors.
-#[allow(clippy::too_many_arguments)]
-fn send_status_full(
-    stream: &mut UnixStream,
-    enabled: &Arc<AtomicBool>,
-    cps: &Arc<AtomicU32>,
-    button: &Arc<Mutex<String>>,
-    mode: &Arc<Mutex<ClickMode>>,
-    randomize: &Arc<AtomicBool>,
-    jitter_ms: &Arc<AtomicU32>,
-) -> Result<()> {
+fn send_status_full(stream: &mut UnixStream, state: &ClickerState) -> Result<()> {
     let msg = BackendToGui::Status {
-        enabled: enabled.load(Ordering::Relaxed),
-        cps: cps.load(Ordering::Relaxed),
-        button: button.lock().unwrap().clone(),
-        mode: mode.lock().unwrap().as_str().to_string(),
-        randomize: randomize.load(Ordering::Relaxed),
-        jitter_ms: jitter_ms.load(Ordering::Relaxed),
+        enabled: state.enabled.load(Ordering::Relaxed),
+        cps: state.cps.load(Ordering::Relaxed),
+        button: state.button.lock().unwrap().clone(),
+        mode: state.mode.lock().unwrap().as_str().to_string(),
+        randomize: state.randomize.load(Ordering::Relaxed),
+        jitter_ms: state.jitter_ms.load(Ordering::Relaxed),
+        repeat_count: state.repeat_count.load(Ordering::Relaxed),
     };
     let mut json = serde_json::to_vec(&msg)?;
     json.push(b'\n');
@@ -389,7 +337,7 @@ fn send_status_full(
             // Fire-and-forget one-shot commands: requester closed its end before
             // we got the full payload out. Not an error from the backend's
             // perspective — the long-lived GUI listener receives its own
-            // dedicated send_status_full_to_gui() write.
+            // dedicated send_status_from_state_to_gui() write.
             log::debug!("Requester closed before full Status reply");
             Ok(())
         }
@@ -397,17 +345,10 @@ fn send_status_full(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_connection_with_buffer(
     stream: &UnixStream,
     buffer: &[u8],
-    enabled: &Arc<AtomicBool>,
-    cps: &Arc<AtomicU32>,
-    button: &Arc<Mutex<String>>,
-    mode: &Arc<Mutex<ClickMode>>,
-    randomize: &Arc<AtomicBool>,
-    jitter_ms: &Arc<AtomicU32>,
-    repeat_count: &Arc<AtomicU32>,
+    state: &ClickerState,
     gui_stream_for_hotkey: Arc<Mutex<Option<UnixStream>>>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -427,147 +368,51 @@ fn handle_connection_with_buffer(
     // Handle message
     match msg {
         GuiToBackend::Start => {
-            enabled.store(true, Ordering::Relaxed);
+            state.enabled.store(true, Ordering::Relaxed);
             log::info!("Autoclick STARTED via GUI");
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::Stop => {
-            enabled.store(false, Ordering::Relaxed);
+            state.enabled.store(false, Ordering::Relaxed);
             log::info!("Autoclick STOPPED via GUI");
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::Toggle => {
-            let new_state = !enabled.load(Ordering::Relaxed);
-            enabled.store(new_state, Ordering::Relaxed);
+            let new_state = !state.enabled.load(Ordering::Relaxed);
+            state.enabled.store(new_state, Ordering::Relaxed);
             log::info!(
                 "Autoclick {} via IPC toggle",
                 if new_state { "STARTED" } else { "STOPPED" }
             );
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetCps(new_cps) => {
             let new_cps = new_cps.clamp(1, 1000);
-            cps.store(new_cps, Ordering::Relaxed);
+            state.cps.store(new_cps, Ordering::Relaxed);
             log::info!("CPS set to {} via GUI", new_cps);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::IncreaseCps => {
-            let current = cps.load(Ordering::Relaxed);
+            let current = state.cps.load(Ordering::Relaxed);
             let step = config::Config::get_cps_step(current);
             let new_cps = (current + step).min(1000);
-            cps.store(new_cps, Ordering::Relaxed);
+            state.cps.store(new_cps, Ordering::Relaxed);
             log::info!("CPS increased to {} via IPC", new_cps);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::DecreaseCps => {
-            let current = cps.load(Ordering::Relaxed);
+            let current = state.cps.load(Ordering::Relaxed);
             let step = config::Config::get_cps_step(current.saturating_sub(1));
             let new_cps = current.saturating_sub(step).max(1);
-            cps.store(new_cps, Ordering::Relaxed);
+            state.cps.store(new_cps, Ordering::Relaxed);
             log::info!("CPS decreased to {} via IPC", new_cps);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetButton(new_button) => {
             let new_button = match new_button.to_lowercase().as_str() {
@@ -575,114 +420,38 @@ fn handle_connection_with_buffer(
                 "middle" => "middle".to_string(),
                 _ => "left".to_string(),
             };
-            *button.lock().unwrap() = new_button.clone();
+            *state.button.lock().unwrap() = new_button.clone();
             log::info!("Button set to {} via GUI", new_button);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetMode(new_mode) => {
-            *mode.lock().unwrap() = ClickMode::from_str(&new_mode);
+            *state.mode.lock().unwrap() = ClickMode::from_str(&new_mode);
             log::info!("Click mode set to {} via GUI", new_mode);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetRandomize(enabled_random) => {
-            randomize.store(enabled_random, Ordering::Relaxed);
+            state.randomize.store(enabled_random, Ordering::Relaxed);
             log::info!("Randomize set to {} via GUI", enabled_random);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetJitterMs(jitter) => {
-            jitter_ms.store(jitter.min(100), Ordering::Relaxed);
+            state.jitter_ms.store(jitter.min(100), Ordering::Relaxed);
             log::info!("Jitter set to {}ms via GUI", jitter);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetRepeatCount(count) => {
-            repeat_count.store(count.min(1_000_000), Ordering::Relaxed);
+            state.repeat_count.store(count.min(1_000_000), Ordering::Relaxed);
             log::info!("Repeat count set to {} via GUI", count);
-            send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            )?;
-            send_status_full_to_gui(
-                &gui_stream_for_hotkey,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
+            send_status_full(&mut stream, state)?;
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
+        }
+        GuiToBackend::GetStatus => {
+            log::debug!("Status requested via IPC");
+            send_status_full(&mut stream, state)?;
         }
         GuiToBackend::SubscribeGui => {
             log::info!("GUI notification subscription received");
@@ -711,24 +480,10 @@ fn handle_connection_with_buffer(
             // send_status may fail with broken pipe if the GUI already
             // closed its end after sending Quit — that's fine, the GUI is
             // exiting too. Ignore the result and proceed with shutdown.
-            let _ = send_status_full(
-                &mut stream,
-                enabled,
-                cps,
-                button,
-                mode,
-                randomize,
-                jitter_ms,
-            );
-            // Quit is handled on a per-connection thread. Exiting immediately
-            // avoids a window where the socket is gone but the process is
-            // still winding down, which can strand the GUI's release event
-            // loop between its presence and reaping checks. The kernel closes
-            // all uinput/socket descriptors on process exit, so the virtual
-            // device is still released deterministically.
+            let _ = send_status_full(&mut stream, state);
             shutdown.store(true, Ordering::Relaxed);
             let _ = std::fs::remove_file(SOCKET_PATH);
-            std::process::exit(0);
+            return Ok(());
         }
     }
 

@@ -173,6 +173,7 @@ pub fn merge_backend_settings(
     mode: String,
     randomize: bool,
     jitter_ms: u32,
+    repeat_count: u32,
 ) {
     let path = state_path();
     let _guard = STATE_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -185,6 +186,7 @@ pub fn merge_backend_settings(
     snapshot.mode = mode;
     snapshot.randomize = randomize;
     snapshot.jitter_ms = jitter_ms.min(100);
+    snapshot.repeat_count = repeat_count.min(1_000_000);
     save_to_disk_locked(&path, &snapshot);
 }
 
