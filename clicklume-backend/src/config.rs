@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Key to toggle autoclicking
     pub toggle: String,
@@ -130,7 +131,8 @@ impl Config {
         }
 
         let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&config_path, contents).context("Failed to write config file")?;
+        common::write_atomic(&config_path, contents.as_bytes())
+            .context("Failed to write config file")?;
         Ok(())
     }
 

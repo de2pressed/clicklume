@@ -6,10 +6,13 @@
 # currently-active local session user. We re-apply it independently of
 # Steam's rule (70-snap.steam.rules) so clicklume works without Steam.
 #
+# The rule runs after 73-seat-late.rules, so explicitly schedule the
+# uaccess builtin here; adding the tag alone at priority 99 is too late.
+#
 # Install with:
 #   sudo cp 99-clicklume-uinput.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger --name-match=uinput
 #
 # (clicklume's install.sh can do this for you with sudo.)
-KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", RUN{builtin}+="uaccess", OPTIONS+="static_node=uinput"

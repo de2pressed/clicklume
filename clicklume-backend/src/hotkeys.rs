@@ -56,10 +56,14 @@ pub fn parse_keycode(name: &str) -> Option<KeyCode> {
     let stripped = normalized.strip_prefix("KEY_").unwrap_or(&normalized);
     if let Some(num_str) = stripped.strip_prefix('F') {
         if let Ok(n) = num_str.parse::<u8>() {
-            if (1..=12).contains(&n) {
-                // Linux input-event-codes.h: KEY_F1=59, KEY_F2=60, ..., KEY_F12=70.
+            if (1..=10).contains(&n) {
+                // F1..F10 are contiguous; F11/F12 are 87/88.
                 let code = 58 + n as u16;
                 return Some(KeyCode(code));
+            } else if n == 11 {
+                return Some(KeyCode::KEY_F11);
+            } else if n == 12 {
+                return Some(KeyCode::KEY_F12);
             } else if (13..=24).contains(&n) {
                 // Linux input-event-codes.h: KEY_F13=183, ..., KEY_F24=194.
                 let code = 183 + (n - 13) as u16;
@@ -212,7 +216,10 @@ pub fn find_keyboard_devices_for_hotkeys(
     found.dedup();
 
     if !found.is_empty() {
-        log::info!("Discovered {} new hotkey-capable input device(s):", found.len());
+        log::info!(
+            "Discovered {} new hotkey-capable input device(s):",
+            found.len()
+        );
         for p in &found {
             log::info!("  {} ({})", p.display(), device_name_for(p));
         }
@@ -238,6 +245,7 @@ impl WatchedDevice {
 pub struct HotkeyReader {
     running: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
+    active_paths: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl HotkeyReader {
@@ -255,6 +263,7 @@ impl HotkeyReader {
         let mut reader = HotkeyReader {
             running: running.clone(),
             threads: Vec::new(),
+            active_paths: active_paths.clone(),
         };
 
         rescan_and_spawn(
@@ -321,7 +330,7 @@ impl HotkeyReader {
                                             &mut detached,
                                         );
                                         for handle in detached {
-                                            std::mem::forget(handle);
+                                            drop(handle);
                                         }
                                     }
                                 }
@@ -349,7 +358,7 @@ impl HotkeyReader {
                             &mut detached,
                         );
                         for handle in detached {
-                            std::mem::forget(handle);
+                            drop(handle);
                         }
                     }
                 }
@@ -359,6 +368,10 @@ impl HotkeyReader {
         reader.threads.push(monitor_handle);
 
         Ok((reader, rx))
+    }
+
+    pub fn has_devices(&self) -> bool {
+        !self.active_paths.lock().unwrap().is_empty()
     }
 
     #[allow(dead_code)]
@@ -384,7 +397,9 @@ fn rescan_and_spawn(
     let devices = find_keyboard_devices_for_hotkeys(hotkeys, &currently_active);
     if devices.is_empty() {
         if currently_active.is_empty() {
-            log::warn!("No hotkey-capable keyboard devices found. Hotkeys disabled until one appears.");
+            log::warn!(
+                "No hotkey-capable keyboard devices found. Hotkeys disabled until one appears."
+            );
         }
         return;
     }
@@ -463,7 +478,10 @@ fn reader_thread(
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
                 continue;
             }
             Err(e) => {
@@ -487,6 +505,16 @@ fn reader_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_keys_match_evdev_codes() {
+        assert_eq!(parse_keycode("F10"), Some(KeyCode::KEY_F10));
+        assert_eq!(parse_keycode("KEY_F11"), Some(KeyCode::KEY_F11));
+        assert_eq!(parse_keycode("f12"), Some(KeyCode::KEY_F12));
+        assert_eq!(parse_keycode("F13"), Some(KeyCode::KEY_F13));
+        assert_eq!(parse_keycode("F24"), Some(KeyCode::KEY_F24));
+        assert_eq!(parse_keycode("F25"), None);
+    }
 
     #[test]
     fn test_excluded_devices() {
@@ -531,4 +559,3 @@ mod tests {
         }
     }
 }
-

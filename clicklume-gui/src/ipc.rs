@@ -7,7 +7,7 @@
 //!     actually lands before the process tears down
 
 use common::GuiToBackend;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -30,12 +30,12 @@ fn try_send(cmd: &GuiToBackend, write_timeout: Option<Duration>) -> std::io::Res
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     stream.write_all(&json)?;
 
-    // Normal UI commands receive a full Status response. Reading it here
-    // makes button presses deterministic and prevents the backend from
-    // writing into a socket the UI has already discarded. A timeout is still
-    // treated as success because the command itself was already delivered.
-    stream.set_read_timeout(Some(write_timeout.unwrap_or(Duration::from_millis(250))))?;
-    let mut response = [0u8; 4096];
-    let _ = stream.read(&mut response);
-    Ok(())
+    stream.set_read_timeout(Some(write_timeout.unwrap_or(Duration::from_millis(500))))?;
+    let mut response = String::new();
+    BufReader::new(stream.take(4096)).read_line(&mut response)?;
+    match serde_json::from_str::<common::BackendToGui>(&response) {
+        Ok(common::BackendToGui::Error(error)) => Err(std::io::Error::other(error)),
+        Ok(_) => Ok(()),
+        Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    }
 }

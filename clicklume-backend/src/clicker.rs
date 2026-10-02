@@ -84,6 +84,7 @@ pub struct Clicker {
     state: ClickerState,
     running: Arc<AtomicBool>,
     on_auto_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Clicker {
@@ -93,6 +94,7 @@ impl Clicker {
             state,
             running: Arc::new(AtomicBool::new(true)),
             on_auto_stop: None,
+            worker: Mutex::new(None),
         }
     }
 
@@ -187,7 +189,12 @@ impl Clicker {
 
     /// Perform one click "event" (single press, double press, or hold) for
     /// the current mode. Returns true if any button events were emitted.
-    fn emit_click_event(&self, device: &mut VirtualDevice, btn_code: KeyCode, interval: Duration) -> Result<()> {
+    fn emit_click_event(
+        &self,
+        device: &mut VirtualDevice,
+        btn_code: KeyCode,
+        interval: Duration,
+    ) -> Result<()> {
         let mode = *self.state.mode.lock().unwrap();
         match mode {
             ClickMode::Single => {
@@ -195,35 +202,53 @@ impl Clicker {
                 // button presses held for <10ms trigger the hardware debounce filter
                 // (DEBOUNCE_TIMEOUT_BOUNCE), causing the release to be suppressed and locking
                 // the mouse button in the down state.
-                let hold = (interval / 2).clamp(Duration::from_millis(5), Duration::from_millis(25));
+                let hold =
+                    (interval / 2).clamp(Duration::from_millis(5), Duration::from_millis(25));
                 Self::send_button_event(device, btn_code, true)?;
-                thread::sleep(hold);
+                self.wait_while_enabled(hold);
                 Self::send_button_event(device, btn_code, false)?;
             }
             ClickMode::Double => {
-                let hold = (interval / 4).clamp(Duration::from_millis(5), Duration::from_millis(20));
+                let hold =
+                    (interval / 4).clamp(Duration::from_millis(5), Duration::from_millis(20));
                 Self::send_button_event(device, btn_code, true)?;
-                thread::sleep(hold);
+                self.wait_while_enabled(hold);
                 Self::send_button_event(device, btn_code, false)?;
-                thread::sleep(Duration::from_millis(25));
+                if !self.wait_while_enabled(Duration::from_millis(25)) {
+                    return Ok(());
+                }
                 Self::send_button_event(device, btn_code, true)?;
-                thread::sleep(hold);
+                self.wait_while_enabled(hold);
                 Self::send_button_event(device, btn_code, false)?;
             }
             ClickMode::Hold => {
                 // Press and release over the full interval — sustained
-                // press for half the interval, release for the second half
+                // press for the full interval before releasing
                 Self::send_button_event(device, btn_code, true)?;
-                let hold = interval / 2;
-                thread::sleep(hold);
+                let hold = interval;
+                self.wait_while_enabled(hold);
                 Self::send_button_event(device, btn_code, false)?;
             }
         }
         Ok(())
     }
 
+    /// Wait in short slices so Stop/Quit promptly releases held buttons.
+    fn wait_while_enabled(&self, duration: Duration) -> bool {
+        let deadline = std::time::Instant::now() + duration;
+        while self.running.load(Ordering::Relaxed) && self.state.enabled.load(Ordering::Relaxed) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
+        false
+    }
+
     /// Start the click worker thread
-    pub fn start(&self) {
+    pub fn start(&self) -> Result<()> {
+        let mut device = Self::create_virtual_mouse()?;
         let running = self.running.clone();
         let enabled = self.state.enabled.clone();
         let cps = self.state.cps.clone();
@@ -234,18 +259,10 @@ impl Clicker {
         let repeat_count = self.state.repeat_count.clone();
         let on_auto_stop = self.on_auto_stop.clone();
 
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             log::info!("Click worker thread started");
 
-            let mut device = match Self::create_virtual_mouse() {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("Failed to create virtual mouse: {}", e);
-                    return;
-                }
-            };
-
-            let clicker = Clicker::new(ClickerState {
+            let mut clicker = Clicker::new(ClickerState {
                 enabled: enabled.clone(),
                 cps: cps.clone(),
                 button: button.clone(),
@@ -254,6 +271,8 @@ impl Clicker {
                 jitter_ms: jitter_ms.clone(),
                 repeat_count: repeat_count.clone(),
             });
+
+            clicker.running = running.clone();
 
             let mut completed_actions = 0u32;
             let mut was_enabled = false;
@@ -283,19 +302,16 @@ impl Clicker {
                 let start = std::time::Instant::now();
 
                 if let Err(e) = clicker.emit_click_event(&mut device, btn_code, interval) {
-                    log::debug!("Click emission failed: {}", e);
+                    log::error!("Click emission failed: {}", e);
+                    let _ = Self::send_button_event(&mut device, btn_code, false);
+                    enabled.store(false, Ordering::Relaxed);
+                    if let Some(ref cb) = on_auto_stop {
+                        cb();
+                    }
+                    continue;
                 }
 
-                let elapsed = start.elapsed();
-                if elapsed < interval {
-                    let remaining = interval - elapsed;
-                    if remaining >= Duration::from_millis(2) {
-                        thread::sleep(remaining - Duration::from_millis(1));
-                    }
-                    while start.elapsed() < interval {
-                        std::hint::spin_loop();
-                    }
-                }
+                clicker.wait_while_enabled(interval.saturating_sub(start.elapsed()));
 
                 let limit = repeat_count.load(Ordering::Relaxed);
                 if limit > 0 {
@@ -317,11 +333,16 @@ impl Clicker {
 
             log::info!("Click worker thread terminated");
         });
+        *self.worker.lock().unwrap() = Some(worker);
+        Ok(())
     }
 
     /// Stop the clicker
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
     }
 
     /// Check if clicker is enabled
@@ -340,5 +361,29 @@ impl Clicker {
     #[allow(dead_code)]
     pub fn get_button(&self) -> String {
         self.state.button.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Clicker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stop_interrupts_long_hold_wait() {
+        let state = ClickerState::new(1, "left".into());
+        state.enabled.store(true, Ordering::Relaxed);
+        let clicker = Arc::new(Clicker::new(state));
+        let waiter = clicker.clone();
+        let thread = thread::spawn(move || waiter.wait_while_enabled(Duration::from_secs(1)));
+        thread::sleep(Duration::from_millis(10));
+        let start = std::time::Instant::now();
+        clicker.stop();
+        assert!(!thread.join().unwrap());
+        assert!(start.elapsed() < Duration::from_millis(200));
     }
 }

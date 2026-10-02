@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const STATE_DIR: &str = "clicklume";
 const LEGACY_STATE_DIR: &str = "autoclick";
 const STATE_FILE: &str = "state.toml";
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 static STATE_FILE_LOCK: Mutex<()> = Mutex::new(());
+static LATEST_STATE: Mutex<Option<PersistentState>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentState {
@@ -113,28 +114,23 @@ pub fn load() -> PersistentState {
 
 /// Spawn a background save worker. Returns a Sender that you can push
 /// new `PersistentState` snapshots to; the worker debounces writes.
-pub fn spawn_saver() -> Sender<PersistentState> {
-    let (tx, rx) = mpsc::channel::<PersistentState>();
+pub fn spawn_saver() -> Sender<()> {
+    *LATEST_STATE.lock().unwrap() = Some(load());
+    let (tx, rx) = mpsc::channel::<()>();
     thread::spawn(move || {
-        let path = state_path();
-        let mut latest: Option<PersistentState> = None;
-        let mut last_change = Instant::now();
+        let mut dirty = false;
         loop {
             match rx.recv_timeout(SAVE_DEBOUNCE) {
-                Ok(snapshot) => {
-                    latest = Some(snapshot);
-                    last_change = Instant::now();
-                }
+                Ok(()) => dirty = true,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(snap) = latest.take() {
-                        if last_change.elapsed() >= SAVE_DEBOUNCE {
-                            save_to_disk(&path, &snap);
-                        }
+                    if dirty {
+                        flush();
+                        dirty = false;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if let Some(snap) = latest.take() {
-                        save_to_disk(&path, &snap);
+                    if dirty {
+                        flush();
                     }
                     break;
                 }
@@ -142,6 +138,47 @@ pub fn spawn_saver() -> Sender<PersistentState> {
         }
     });
     tx
+}
+
+/// Stage synchronously: a delayed worker never writes an older snapshot over
+/// a newer global hotkey update received by the notification listener.
+pub fn queue_save(tx: &Sender<()>, previous: &PersistentState, snapshot: PersistentState) {
+    let mut latest = LATEST_STATE.lock().unwrap();
+    if let Some(current) = latest.as_mut() {
+        merge_gui_changes(current, previous, snapshot);
+    } else {
+        *latest = Some(snapshot);
+    }
+    let _ = tx.send(());
+}
+
+fn merge_gui_changes(
+    current: &mut PersistentState,
+    previous: &PersistentState,
+    next: PersistentState,
+) {
+    macro_rules! update {
+        ($($field:ident),*) => { $(if previous.$field != next.$field { current.$field = next.$field; })* };
+    }
+    update!(
+        cps,
+        button,
+        mode,
+        randomize,
+        jitter_ms,
+        repeat_count,
+        always_on_top,
+        autostart,
+        dark_mode,
+        window_pos
+    );
+}
+
+pub fn flush() {
+    let latest = LATEST_STATE.lock().unwrap();
+    if let Some(snapshot) = latest.as_ref() {
+        save_to_disk(&state_path(), snapshot);
+    }
 }
 
 fn save_to_disk(path: &Path, snapshot: &PersistentState) {
@@ -155,7 +192,7 @@ fn save_to_disk_locked(path: &Path, snapshot: &PersistentState) {
     }
     match toml::to_string_pretty(snapshot) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(path, text) {
+            if let Err(e) = common::write_atomic(path, text.as_bytes()) {
                 log::warn!("Failed to write {}: {}", path.display(), e);
             }
         }
@@ -176,11 +213,9 @@ pub fn merge_backend_settings(
     repeat_count: u32,
 ) {
     let path = state_path();
+    let mut latest = LATEST_STATE.lock().unwrap();
+    let mut snapshot = latest.clone().unwrap_or_else(load);
     let _guard = STATE_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut snapshot = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| toml::from_str::<PersistentState>(&text).ok())
-        .unwrap_or_default();
     snapshot.cps = cps.clamp(1, 1000);
     snapshot.button = button;
     snapshot.mode = mode;
@@ -188,11 +223,24 @@ pub fn merge_backend_settings(
     snapshot.jitter_ms = jitter_ms.min(100);
     snapshot.repeat_count = repeat_count.min(1_000_000);
     save_to_disk_locked(&path, &snapshot);
+    *latest = Some(snapshot);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PersistentState;
+    use super::{merge_gui_changes, PersistentState};
+
+    #[test]
+    fn theme_save_preserves_newer_global_hotkey_settings() {
+        let previous = PersistentState::default();
+        let mut current = previous.clone();
+        current.cps = 42;
+        let mut next = previous.clone();
+        next.dark_mode = false;
+        merge_gui_changes(&mut current, &previous, next);
+        assert_eq!(current.cps, 42);
+        assert!(!current.dark_mode);
+    }
 
     #[test]
     fn legacy_state_defaults_to_dark_mode() {

@@ -31,6 +31,15 @@ fn main() -> Result<()> {
     // No root required. /dev/uinput has ACL granting user access; we only
     // emit synthetic input — never read physical devices. See README.
 
+    let _instance_lock = lock_instance()?;
+    anyhow::ensure!(
+        UnixStream::connect(SOCKET_PATH).is_err(),
+        "A backend already owns the socket"
+    );
+    unsafe {
+        libc::umask(0o077);
+    }
+
     // Load configuration
     let cfg = config::Config::load()?;
     log::info!("Configuration loaded successfully");
@@ -46,8 +55,8 @@ fn main() -> Result<()> {
     let button = Arc::new(Mutex::new(cfg.button.clone()));
     let mode = Arc::new(Mutex::new(ClickMode::from_str(&cfg.mode)));
     let randomize = Arc::new(AtomicBool::new(cfg.randomize));
-    let jitter_ms = Arc::new(AtomicU32::new(cfg.jitter_ms));
-    let repeat_count = Arc::new(AtomicU32::new(cfg.repeat_count));
+    let jitter_ms = Arc::new(AtomicU32::new(cfg.jitter_ms.min(100)));
+    let repeat_count = Arc::new(AtomicU32::new(cfg.repeat_count.min(1_000_000)));
 
     // Create clicker state
     let clicker_state = ClickerState {
@@ -67,12 +76,11 @@ fn main() -> Result<()> {
     // Create and start clicker
     let auto_stop_state = clicker_state.clone();
     let auto_stop_gui_stream = gui_stream.clone();
-    let clicker = clicker::Clicker::new(clicker_state.clone()).with_auto_stop_callback(Arc::new(
-        move || {
+    let clicker =
+        clicker::Clicker::new(clicker_state.clone()).with_auto_stop_callback(Arc::new(move || {
             send_status_from_state_to_gui(&auto_stop_gui_stream, &auto_stop_state);
-        },
-    ));
-    clicker.start();
+        }));
+    clicker.start()?;
 
     // Start the in-process hotkey reader (replaces gsd-media-keys). The reader
     // passively reads configured keyboard devices and pushes HotkeyAction events on a
@@ -103,13 +111,14 @@ fn main() -> Result<()> {
             }
         };
     // Keep hotkey_reader alive for the whole backend lifetime.
-    let _hotkey_reader_keepalive = hotkey_reader;
+    let hotkeys_available = Arc::new(AtomicBool::new(hotkey_reader.has_devices()));
 
     // Spawn a drain thread: pulls HotkeyAction events, mutates shared state,
     // pushes Status + HotkeyPressed notifications to the GUI listener.
     let hotkey_drain_state = clicker_state.clone();
     let hotkey_drain_shutdown = shutdown.clone();
     let hotkey_drain_gui_stream = gui_stream.clone();
+    let hotkey_cfg = cfg.clone();
     std::thread::spawn(move || {
         log::info!("Hotkey drain thread started");
         while !hotkey_drain_shutdown.load(Ordering::Relaxed) {
@@ -126,30 +135,20 @@ fn main() -> Result<()> {
                     // state via the push below.
                     match action {
                         hotkeys::HotkeyAction::Toggle => {
-                            let new_state = !hotkey_drain_state.enabled.load(Ordering::Relaxed);
-                            hotkey_drain_state
+                            let new_state = !hotkey_drain_state
                                 .enabled
-                                .store(new_state, Ordering::Relaxed);
+                                .fetch_xor(true, Ordering::Relaxed);
                             log::info!(
                                 "Autoclick {} via in-process hotkey",
                                 if new_state { "STARTED" } else { "STOPPED" }
                             );
                         }
                         hotkeys::HotkeyAction::Increase => {
-                            let current = hotkey_drain_state.cps.load(Ordering::Relaxed);
-                            let step = config::Config::get_cps_step(current);
-                            let new_cps = (current + step).min(1000);
-                            hotkey_drain_state.cps.store(new_cps, Ordering::Relaxed);
+                            let new_cps = change_cps(&hotkey_drain_state.cps, &hotkey_cfg, true);
                             log::info!("CPS increased to {} via in-process hotkey", new_cps);
                         }
                         hotkeys::HotkeyAction::Decrease => {
-                            let current = hotkey_drain_state
-                                .cps
-                                .load(Ordering::Relaxed)
-                                .saturating_sub(1);
-                            let step = config::Config::get_cps_step(current);
-                            let new_cps = current.saturating_sub(step).max(1);
-                            hotkey_drain_state.cps.store(new_cps, Ordering::Relaxed);
+                            let new_cps = change_cps(&hotkey_drain_state.cps, &hotkey_cfg, false);
                             log::info!("CPS decreased to {} via in-process hotkey", new_cps);
                         }
                         hotkeys::HotkeyAction::Quit => {
@@ -184,7 +183,7 @@ fn main() -> Result<()> {
     // Make socket accessible to non-root users
     std::fs::set_permissions(
         SOCKET_PATH,
-        std::os::unix::fs::PermissionsExt::from_mode(0o666),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
 
     // Create legacy symlink for backward compatibility with existing tools / GNOME extensions
@@ -198,45 +197,36 @@ fn main() -> Result<()> {
     // long-lived notification listener can't block one-shot CLI invocations.
     // Loop exits when shutdown flag is set (via Quit IPC or signal).
     while !shutdown.load(Ordering::Relaxed) {
+        let available = hotkey_reader.has_devices();
+        if hotkeys_available.swap(available, Ordering::Relaxed) != available {
+            send_hotkey_availability(&gui_stream, available);
+        }
         match socket_listener.accept() {
             Ok((mut stream, _addr)) => {
                 log::info!("Connection received");
                 let clicker_state_clone = clicker_state.clone();
                 let gui_stream_clone = gui_stream.clone();
                 let shutdown_clone = shutdown.clone();
+                let connection_cfg = cfg.clone();
+                let connection_hotkeys_available = hotkeys_available.clone();
                 std::thread::spawn(move || {
-                    // Detect listener vs command: set a short read timeout.
-                    // If the read times out (no data arrived), this is the
-                    // GUI's long-lived notification listener — register it.
-                    // Otherwise the read returns the command bytes and we
-                    // handle the command normally.
-                    use std::io::Read;
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                    let mut buf = [0u8; 1024];
-                    match stream.read(&mut buf) {
-                        Ok(0) => {
-                            log::debug!("Connection closed before sending a command; treating as health probe");
-                        }
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                        {
-                            log::debug!("Connection sent no command within probe window; closing");
-                        }
-                        Err(e) => {
-                            log::warn!("Connection probe read failed: {}", e);
-                        }
-                        Ok(n) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    match read_command(&mut stream) {
+                        Ok(buffer) => {
                             if let Err(e) = handle_connection_with_buffer(
                                 &stream,
-                                &buf[..n],
+                                &buffer,
                                 &clicker_state_clone,
                                 gui_stream_clone,
                                 &shutdown_clone,
+                                &connection_cfg,
+                                &connection_hotkeys_available,
                             ) {
-                                log::error!("Error handling connection: {}", e);
+                                log::debug!("Error handling connection: {}", e);
                             }
                         }
+                        Err(e) => log::debug!("Command read failed: {}", e),
                     }
                     log::info!("Connection closed");
                 });
@@ -259,6 +249,23 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(LEGACY_SOCKET_PATH);
 
     Ok(())
+}
+
+fn socket_identity(stream: &UnixStream) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(stream.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() }.st_ino)
+}
+
+fn send_hotkey_availability(gui_stream: &Arc<Mutex<Option<UnixStream>>>, available: bool) {
+    let mut json = serde_json::to_vec(&BackendToGui::HotkeyAvailability(available)).unwrap();
+    json.push(b'\n');
+    if let Some(stream) = gui_stream.lock().unwrap().as_mut() {
+        let _ = stream.write_all(&json);
+    }
 }
 
 fn send_hotkey_notification(gui_stream: &Arc<Mutex<Option<UnixStream>>>, action: &str) {
@@ -299,17 +306,8 @@ fn send_status_from_state_to_gui(
                                 json.len()
                             ),
                             Err(e) => {
-                                if e.kind() == std::io::ErrorKind::BrokenPipe
-                                    || e.kind() == std::io::ErrorKind::ConnectionReset
-                                {
-                                    log::debug!(
-                                        "GUI listener push: connection gone ({}); clearing slot",
-                                        e
-                                    );
-                                    *guard = None;
-                                } else {
-                                    log::warn!("Failed to push full Status to GUI listener: {}", e);
-                                }
+                                log::debug!("GUI listener write failed: {}; clearing slot", e);
+                                *guard = None;
                             }
                         }
                     } else {
@@ -357,6 +355,8 @@ fn handle_connection_with_buffer(
     state: &ClickerState,
     gui_stream_for_hotkey: Arc<Mutex<Option<UnixStream>>>,
     shutdown: &Arc<AtomicBool>,
+    cfg: &config::Config,
+    hotkeys_available: &AtomicBool,
 ) -> Result<()> {
     let mut stream = stream.try_clone()?;
 
@@ -386,8 +386,7 @@ fn handle_connection_with_buffer(
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::Toggle => {
-            let new_state = !state.enabled.load(Ordering::Relaxed);
-            state.enabled.store(new_state, Ordering::Relaxed);
+            let new_state = !state.enabled.fetch_xor(true, Ordering::Relaxed);
             log::info!(
                 "Autoclick {} via IPC toggle",
                 if new_state { "STARTED" } else { "STOPPED" }
@@ -396,26 +395,20 @@ fn handle_connection_with_buffer(
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetCps(new_cps) => {
-            let new_cps = new_cps.clamp(1, 1000);
+            let new_cps = cfg.clamp_cps(new_cps);
             state.cps.store(new_cps, Ordering::Relaxed);
             log::info!("CPS set to {} via GUI", new_cps);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::IncreaseCps => {
-            let current = state.cps.load(Ordering::Relaxed);
-            let step = config::Config::get_cps_step(current);
-            let new_cps = (current + step).min(1000);
-            state.cps.store(new_cps, Ordering::Relaxed);
+            let new_cps = change_cps(&state.cps, cfg, true);
             log::info!("CPS increased to {} via IPC", new_cps);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::DecreaseCps => {
-            let current = state.cps.load(Ordering::Relaxed);
-            let step = config::Config::get_cps_step(current.saturating_sub(1));
-            let new_cps = current.saturating_sub(step).max(1);
-            state.cps.store(new_cps, Ordering::Relaxed);
+            let new_cps = change_cps(&state.cps, cfg, false);
             log::info!("CPS decreased to {} via IPC", new_cps);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
@@ -450,7 +443,9 @@ fn handle_connection_with_buffer(
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::SetRepeatCount(count) => {
-            state.repeat_count.store(count.min(1_000_000), Ordering::Relaxed);
+            state
+                .repeat_count
+                .store(count.min(1_000_000), Ordering::Relaxed);
             log::info!("Repeat count set to {} via GUI", count);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
@@ -462,8 +457,19 @@ fn handle_connection_with_buffer(
         GuiToBackend::SubscribeGui => {
             log::info!("GUI notification subscription received");
             let _ = stream.set_read_timeout(None);
+            let subscription_id = socket_identity(&stream)?;
             let cloned_for_writes = stream.try_clone()?;
-            *gui_stream_for_hotkey.lock().unwrap() = Some(cloned_for_writes);
+            {
+                let mut guard = gui_stream_for_hotkey.lock().unwrap();
+                if guard.is_some() {
+                    return Err(anyhow::anyhow!("A GUI is already subscribed"));
+                }
+                *guard = Some(cloned_for_writes);
+            }
+            send_hotkey_availability(
+                &gui_stream_for_hotkey,
+                hotkeys_available.load(Ordering::Relaxed),
+            );
             log::info!("Registered GUI notification listener");
 
             // Keep this handler alive until the GUI disconnects. Backend status
@@ -476,7 +482,9 @@ fn handle_connection_with_buffer(
                 }
             }
             if let Ok(mut guard) = gui_stream_for_hotkey.lock() {
-                let _ = guard.take();
+                if guard.as_ref().and_then(|s| socket_identity(s).ok()) == Some(subscription_id) {
+                    let _ = guard.take();
+                }
             }
             log::info!("GUI listener disconnected; cleared slot");
             return Ok(());
@@ -494,4 +502,115 @@ fn handle_connection_with_buffer(
     }
 
     Ok(())
+}
+
+/// Serialize backend startup so a second process cannot unlink a live socket.
+fn lock_instance() -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let uid = unsafe { libc::geteuid() };
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/tmp".into());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(base.join(format!("clicklume-{uid}.lock")))?;
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        file.metadata()?.uid() == uid,
+        "Backend lock belongs to another user"
+    );
+    anyhow::ensure!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "Another backend is already running"
+    );
+    Ok(file)
+}
+
+/// Unix streams may split even tiny JSON commands across multiple reads.
+fn read_command(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut buffer = Vec::new();
+    loop {
+        anyhow::ensure!(buffer.len() < 4096, "Command exceeds 4096 bytes");
+        anyhow::ensure!(std::time::Instant::now() < deadline, "Command timed out");
+        let mut chunk = [0; 256];
+        let n = stream.read(&mut chunk)?;
+        anyhow::ensure!(n > 0, "Connection closed before a complete command");
+        buffer.extend_from_slice(&chunk[..n]);
+        match serde_json::from_slice::<GuiToBackend>(&buffer) {
+            Ok(_) => return Ok(buffer),
+            Err(e) if e.is_eof() => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn change_cps(cps: &AtomicU32, cfg: &config::Config, increase: bool) -> u32 {
+    let next = |current: u32| {
+        let step = config::Config::get_cps_step(if increase {
+            current
+        } else {
+            current.saturating_sub(1)
+        });
+        cfg.clamp_cps(if increase {
+            current.saturating_add(step)
+        } else {
+            current.saturating_sub(step)
+        })
+    };
+    let previous = cps
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(next(current))
+        })
+        .unwrap();
+    next(previous)
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+    #[test]
+    fn concurrent_cps_updates_respect_bounds_and_decrease_once() {
+        let cfg = config::Config {
+            max_cps: 100,
+            ..Default::default()
+        };
+        let cps = Arc::new(AtomicU32::new(20));
+        assert_eq!(change_cps(&cps, &cfg, false), 19);
+        cps.store(1, Ordering::Relaxed);
+        let workers: Vec<_> = (0..10)
+            .map(|_| {
+                let cps = cps.clone();
+                let cfg = cfg.clone();
+                std::thread::spawn(move || change_cps(&cps, &cfg, true))
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(cps.load(Ordering::Relaxed), 11);
+        cps.store(100, Ordering::Relaxed);
+        assert_eq!(change_cps(&cps, &cfg, true), 100);
+    }
+
+    #[test]
+    fn fragmented_command_is_read_completely() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = std::thread::spawn(move || {
+            writer.write_all(b"{\"SetCps\":").unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(b"42}").unwrap();
+        });
+        assert!(matches!(
+            serde_json::from_slice::<GuiToBackend>(&read_command(&mut reader).unwrap()).unwrap(),
+            GuiToBackend::SetCps(42)
+        ));
+        sender.join().unwrap();
+    }
 }

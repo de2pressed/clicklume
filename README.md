@@ -14,9 +14,11 @@ hotkeys—no X11 fallback and no root process at runtime.
 ## Features
 
 - Compact monochrome GUI with persistent light and dark modes
-- 1–1000 clicks per second
+- Configurable target rate of 1–1000 actions per second (actual rate depends on
+  click mode, press duration, and OS scheduling)
 - Left, middle, and right mouse buttons
-- Single, double, and hold click modes
+- Single, double, and hold click modes (a repeat count counts actions; double
+  mode emits two clicks per action)
 - Unlimited or fixed repeat counts
 - Optional randomized interval offset
 - Configurable F1–F12 global hotkeys

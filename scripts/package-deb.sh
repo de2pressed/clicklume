@@ -58,6 +58,7 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 set -e
 udevadm control --reload-rules 2>/dev/null || true
 udevadm trigger --subsystem-match=input 2>/dev/null || true
+udevadm trigger --subsystem-match=misc --sysname-match=uinput 2>/dev/null || true
 echo "ClickLume installed. Add your desktop user to the input group if needed:"
 echo "  sudo usermod -aG input <username>"
 echo "Then log out and back in. ClickLume never runs as root."

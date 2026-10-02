@@ -43,7 +43,6 @@ fn main() {
     let mut stream = match UnixStream::connect(SOCKET_PATH) {
         Ok(s) => s,
         Err(e) => {
-            let _ = std::fs::remove_file(SOCKET_PATH);
             eprintln!("clicklume backend not running (cannot connect to {SOCKET_PATH}): {e}");
             std::process::exit(3);
         }
@@ -62,18 +61,21 @@ fn main() {
         std::process::exit(6);
     }
 
-    // Read response if any (best-effort, don't block forever)
-    use std::io::Read;
-    let mut buf = [0u8; 1024];
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                print!("{s}");
-            }
-        }
-        _ => {}
+    // Require a complete, valid reply so scripts can trust the exit status.
+    use std::io::{BufRead, BufReader, Read};
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut response = String::new();
+    let result = BufReader::new(stream.take(4096)).read_line(&mut response);
+    if !matches!(result, Ok(n) if n > 0)
+        || !matches!(
+            serde_json::from_str::<common::BackendToGui>(&response),
+            Ok(common::BackendToGui::Status { .. })
+        )
+    {
+        eprintln!("backend did not return a valid response");
+        std::process::exit(7);
     }
-
-    // Exit cleanly
+    print!("{response}");
 }

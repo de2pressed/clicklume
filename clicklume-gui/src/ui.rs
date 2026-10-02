@@ -79,12 +79,12 @@ fn click_interval(ui: &mut egui::Ui, app: &mut App, p: Palette) {
         let mut cps = app.cps;
         let slider = ui.add_sized(
             [300.0, 30.0],
-            egui::Slider::new(&mut cps, 1..=100).show_value(false),
+            egui::Slider::new(&mut cps, 1..=1000).show_value(false),
         );
         let value = ui.add_sized(
             [92.0, 30.0],
             egui::DragValue::new(&mut cps)
-                .range(1..=100)
+                .range(1..=1000)
                 .speed(1.0)
                 .suffix(" CPS"),
         );
@@ -288,7 +288,10 @@ fn footer(ui: &mut egui::Ui, app: &mut App, p: Palette) {
         let quit_key = hotkey_name(&app.hotkeys.quit);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(caption(
-                format!("{} faster  ·  {} slower  ·  {} quit", inc_key, dec_key, quit_key),
+                format!(
+                    "{} faster  ·  {} slower  ·  {} quit",
+                    inc_key, dec_key, quit_key
+                ),
                 p,
             ));
         });
@@ -357,11 +360,7 @@ fn hotkey_settings_window(app: &mut App, ctx: &egui::Context, p: Palette) {
             });
             if let Some(ref err) = app.last_error {
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new(err)
-                        .font(theme::caption_font())
-                        .color(p.text),
-                );
+                ui.label(RichText::new(err).font(theme::caption_font()).color(p.text));
             }
         });
     if close_requested {

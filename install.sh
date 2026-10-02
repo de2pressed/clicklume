@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install ClickLume for the current user. Root is used only for the optional
 # udev/input-group setup; the application always runs unprivileged.
-set -uo pipefail
+set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/clicklume/bin"
@@ -35,6 +35,8 @@ run_privileged() {
     shift
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
+    elif [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
+        sudo "$@"
     elif sudo -n true 2>/dev/null; then
         sudo -n "$@"
     else
@@ -91,8 +93,7 @@ fi
 sed "s|@GUI_BIN@|$INSTALL_DIR/clicklume-gui|g" \
     "$PROJECT_DIR/systemd/clicklume.service" > "$SERVICE_DIR/clicklume.service"
 chmod 0644 "$SERVICE_DIR/clicklume.service"
-systemctl --user daemon-reload
-systemctl --user disable clicklume.service >/dev/null 2>&1 || true
+systemctl --user daemon-reload || true
 # Prevent the pre-rename service from launching a second copy after upgrade.
 systemctl --user disable --now autoclick-gui.service >/dev/null 2>&1 || true
 # Clean up legacy GNOME Shell extension if present (prevents F6/F9 hijacking)
@@ -110,6 +111,7 @@ if [ "$SKIP_SYSTEM_SETUP" -eq 0 ]; then
         "$PROJECT_DIR/udev/99-clicklume-keyboards.rules" \
         /etc/udev/rules.d/99-clicklume-keyboards.rules || true
     run_privileged "udev reload" udevadm control --reload-rules || true
+    run_privileged "uinput refresh" udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
     run_privileged "udev input refresh" udevadm trigger --subsystem-match=input || true
     if ! id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
         run_privileged "input group membership" usermod -aG input "$USER" || true

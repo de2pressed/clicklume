@@ -160,7 +160,7 @@ fn save_hotkeys(settings: &HotkeySettings) -> std::io::Result<()> {
     }
     let text = toml::to_string_pretty(&value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, text)
+    common::write_atomic(&path, text.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ extern "C" fn sigterm_handler(_sig: i32) {
 fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
     let (tx, rx) = mpsc::channel::<()>();
     let mut pipefds = [0i32; 2];
-    let r = unsafe { libc::pipe(pipefds.as_mut_ptr()) };
+    let r = unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC) };
     if r != 0 {
         log::warn!("Failed to create self-pipe for signal handling");
         return rx;
@@ -202,7 +202,7 @@ fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
     }
     let read_fd = pipefds[0];
     thread::spawn(move || {
-        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::fd::FromRawFd;
         let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
         let mut buf = [0u8; 16];
         loop {
@@ -217,7 +217,6 @@ fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
                 Err(_) => break,
             }
         }
-        let _ = f.into_raw_fd();
     });
     rx
 }
@@ -235,7 +234,7 @@ const UNIT_NAME: &str = "clicklume.service";
 /// with --user and lets systemd log via dbus. Errors are logged but
 /// otherwise ignored — the GUI must still run even if the service file
 /// is missing (e.g., fresh install).
-fn apply_autostart(enable: bool) {
+fn apply_autostart(enable: bool) -> bool {
     let verb = if enable { "enable" } else { "disable" };
     match std::process::Command::new(USER_SYSTEMCTL)
         .args(["--user", verb, UNIT_NAME])
@@ -243,6 +242,7 @@ fn apply_autostart(enable: bool) {
     {
         Ok(out) if out.status.success() => {
             log::info!("Autostart {}: applied", verb);
+            return true;
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -255,6 +255,7 @@ fn apply_autostart(enable: bool) {
         }
         Err(e) => log::warn!("Autostart {}: failed to spawn systemctl: {}", verb, e),
     }
+    false
     // Re-evaluate WantedBy= so a disabled service actually stops being
     // pulled in next login. `disable` does this by symlink removal;
     // `enable` recreates it.
@@ -341,6 +342,7 @@ fn listen_for_notifications(
     ctx: egui::Context,
     backend_pid: Arc<AtomicU32>,
     shutting_down: Arc<AtomicBool>,
+    global_hotkeys_available: Arc<AtomicBool>,
 ) {
     let mut backoff_ms: u64 = 100;
     let mut supervised_child: Option<std::process::Child> = None;
@@ -374,6 +376,10 @@ fn listen_for_notifications(
                                 Ok(msg) => {
                                     log::info!("GUI listener parsed: {:?}", msg);
                                     match &msg {
+                                        BackendToGui::HotkeyAvailability(available) => {
+                                            global_hotkeys_available
+                                                .store(*available, Ordering::Release);
+                                        }
                                         BackendToGui::HotkeyPressed(action) if action == "quit" => {
                                             // GNOME can defer an idle/minimized Wayland window's
                                             // next native event-loop pass indefinitely, so a
@@ -438,6 +444,7 @@ fn listen_for_notifications(
                 }
             }
             backend_pid.store(0, Ordering::Release);
+            global_hotkeys_available.store(false, Ordering::Release);
             let _ = tx.send(GuiEvent::Disconnected);
             ctx.request_repaint();
             if !shutting_down.load(Ordering::Acquire) {
@@ -481,10 +488,11 @@ pub struct App {
     backend_child: Option<std::process::Child>,
     backend_pid: Arc<AtomicU32>,
     shutting_down: Arc<AtomicBool>,
+    global_hotkeys_available: Arc<AtomicBool>,
     last_socket_check: Instant,
 
     persistent: PersistentState,
-    save_tx: Sender<PersistentState>,
+    save_tx: Sender<()>,
 
     cps_last_change: Option<Instant>,
     cps_last_sent: u32,
@@ -510,12 +518,15 @@ impl App {
         let shutting_down = Arc::new(AtomicBool::new(false));
         let listener_backend_pid = Arc::clone(&backend_pid);
         let listener_shutting_down = Arc::clone(&shutting_down);
+        let global_hotkeys_available = Arc::new(AtomicBool::new(false));
+        let listener_hotkeys_available = global_hotkeys_available.clone();
         thread::spawn(move || {
             listen_for_notifications(
                 tx,
                 listener_ctx,
                 listener_backend_pid,
                 listener_shutting_down,
+                listener_hotkeys_available,
             )
         });
 
@@ -534,7 +545,7 @@ impl App {
 
         let mut app = Self {
             enabled: false,
-            cps: persistent.cps.clamp(1, 100),
+            cps: persistent.cps.clamp(1, 1000),
             button: persistent.button.clone(),
             mode: persistent.mode.clone(),
             randomize: persistent.randomize,
@@ -553,6 +564,7 @@ impl App {
             backend_child: None,
             backend_pid,
             shutting_down,
+            global_hotkeys_available,
             last_socket_check: Instant::now(),
             persistent: persistent.clone(),
             save_tx,
@@ -568,15 +580,21 @@ impl App {
 
         app.hotkey_draft = app.hotkeys.clone();
 
-        // Apply the persisted autostart preference to the systemd user service.
-        // (Re-)enable / disable here so the change persists across reboots.
-        apply_autostart(app.autostart);
+        // Read the actual service state; opening the GUI must not change it.
+        if let Ok(output) = std::process::Command::new(USER_SYSTEMCTL)
+            .args(["--user", "is-enabled", UNIT_NAME])
+            .output()
+        {
+            let status = String::from_utf8_lossy(&output.stdout);
+            if matches!(status.trim(), "enabled" | "disabled") {
+                app.autostart = status.trim() == "enabled";
+            }
+        }
 
         // Try connecting to an existing backend first; otherwise spawn one.
         if UnixStream::connect(ipc::SOCKET_PATH).is_ok() {
             app.backend_present = true;
         } else {
-            let _ = std::fs::remove_file(ipc::SOCKET_PATH);
             app.spawn_backend();
         }
 
@@ -591,6 +609,7 @@ impl App {
     }
 
     fn save_persistent(&mut self) {
+        let previous = self.persistent.clone();
         self.persistent.cps = self.cps;
         self.persistent.button = self.button.clone();
         self.persistent.mode = self.mode.clone();
@@ -600,7 +619,7 @@ impl App {
         self.persistent.autostart = self.autostart;
         self.persistent.dark_mode = self.dark_mode;
         let snap = self.persistent.clone();
-        let _ = self.save_tx.send(snap);
+        state::queue_save(&self.save_tx, &previous, snap);
     }
 
     fn cps_step(cps: u32) -> u32 {
@@ -621,7 +640,7 @@ impl App {
             }
             "increase" => {
                 self.hotkey_action_pending = Some(Instant::now());
-                self.set_cps(self.cps.saturating_add(Self::cps_step(self.cps)).min(100));
+                self.set_cps(self.cps.saturating_add(Self::cps_step(self.cps)).min(1000));
             }
             "decrease" => {
                 self.hotkey_action_pending = Some(Instant::now());
@@ -822,7 +841,7 @@ impl App {
     }
 
     pub fn set_cps(&mut self, v: u32) {
-        let v = v.clamp(1, 100);
+        let v = v.clamp(1, 1000);
         if v == self.cps {
             return;
         }
@@ -861,9 +880,12 @@ impl App {
         if on == self.randomize {
             return;
         }
+        let previous = self.randomize;
         self.randomize = on;
         if self.send_command(GuiToBackend::SetRandomize(on), "set randomization") {
             self.save_persistent();
+        } else {
+            self.randomize = previous;
         }
     }
 
@@ -891,9 +913,14 @@ impl App {
         if on == self.autostart {
             return;
         }
-        self.autostart = on;
-        apply_autostart(on);
-        self.save_persistent();
+        if apply_autostart(on) {
+            self.autostart = on;
+            self.save_persistent();
+        } else {
+            self.last_error = Some(
+                "Could not change Start on login; check the user service installation.".into(),
+            );
+        }
     }
 
     pub fn set_dark_mode(&mut self, on: bool) {
@@ -992,6 +1019,7 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         log::info!("GUI exiting — sending Quit to backend");
         self.quit();
+        state::flush();
         if let Some(mut child) = self.backend_child.take() {
             let waiter = thread::spawn(move || {
                 let _ = child.wait();
@@ -1004,7 +1032,6 @@ impl eframe::App for App {
         // A service stop can terminate the backend just after it handled
         // Quit, leaving only the pathname behind. Remove that stale marker so
         // the next launch never mistakes it for a live backend.
-        let _ = std::fs::remove_file(ipc::SOCKET_PATH);
         thread::sleep(Duration::from_millis(500));
     }
 
@@ -1136,6 +1163,7 @@ impl eframe::App for App {
                         self.save_persistent();
                     }
                 }
+                BackendToGui::HotkeyAvailability(_) => {}
                 BackendToGui::Ready => {
                     self.backend_present = true;
                 }
@@ -1172,7 +1200,7 @@ impl eframe::App for App {
             .map(|t| t.elapsed() < Duration::from_millis(600))
             .unwrap_or(false);
 
-        if !backend_hotkey_recent {
+        if !self.global_hotkeys_available.load(Ordering::Acquire) && !backend_hotkey_recent {
             if let Some(key) = parse_egui_key(&self.hotkeys.toggle) {
                 if ctx.input(|i| i.key_pressed(key)) {
                     self.handle_hotkey("toggle");
