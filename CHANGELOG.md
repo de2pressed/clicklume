@@ -27,6 +27,7 @@ Semantic Versioning after the first public preview.
 
 ### Fixed
 
+- Apply repeat-mode changes immediately and flush pending settings before Start, avoiding a stale one-click limit in “Until stopped” mode
 - Correct F11/F12 evdev codes and avoid duplicate focused/global hotkey actions
 - Honor configured CPS bounds and share atomic increase/decrease behavior
 - Accumulate fragmented IPC commands, validate replies, and protect socket ownership

@@ -537,6 +537,10 @@ pub struct App {
     /// When a backend-driven hotkey is being applied, we briefly suppress the
     /// egui window-focused fallback path so the user sees one toggle, not two.
     hotkey_action_pending: Option<Instant>,
+    #[cfg(test)]
+    command_log: Vec<GuiToBackend>,
+    #[cfg(test)]
+    fail_commands: bool,
 }
 
 impl App {
@@ -595,6 +599,10 @@ impl App {
             repeat_last_sent: persistent.repeat_count,
             shutdown_requested: false,
             hotkey_action_pending: None,
+            #[cfg(test)]
+            command_log: Vec::new(),
+            #[cfg(test)]
+            fail_commands: false,
         };
 
         app.hotkey_draft = app.hotkeys.clone();
@@ -687,7 +695,7 @@ impl App {
         }
     }
 
-    fn flush_pending_settings(&mut self) {
+    fn flush_pending_settings(&mut self, force: bool) -> bool {
         if self.cps == self.cps_last_sent {
             self.cps_last_change = None;
         }
@@ -697,43 +705,56 @@ impl App {
         if self.repeat_count == self.repeat_last_sent {
             self.repeat_last_change = None;
         }
-        if !self.backend_present {
-            return;
+        if !self.backend_present && !force {
+            return false;
         }
         if let Some(t) = self.cps_last_change {
-            if t.elapsed() >= CPS_DEBOUNCE
-                && self.cps != self.cps_last_sent
-                && self.send_command(GuiToBackend::SetCps(self.cps), "set click rate")
-            {
+            if (force || t.elapsed() >= CPS_DEBOUNCE) && self.cps != self.cps_last_sent {
+                if !self.send_command(GuiToBackend::SetCps(self.cps), "set click rate") {
+                    return false;
+                }
                 self.cps_last_sent = self.cps;
                 self.cps_last_change = None;
             }
         }
         if let Some(t) = self.jitter_last_change {
-            if t.elapsed() >= CPS_DEBOUNCE
-                && self.jitter_ms != self.jitter_last_sent
-                && self.send_command(GuiToBackend::SetJitterMs(self.jitter_ms), "set jitter")
-            {
+            if (force || t.elapsed() >= CPS_DEBOUNCE) && self.jitter_ms != self.jitter_last_sent {
+                if !self.send_command(GuiToBackend::SetJitterMs(self.jitter_ms), "set jitter") {
+                    return false;
+                }
                 self.jitter_last_sent = self.jitter_ms;
                 self.jitter_last_change = None;
             }
         }
         if let Some(t) = self.repeat_last_change {
-            if t.elapsed() >= CPS_DEBOUNCE
-                && self.repeat_count != self.repeat_last_sent
-                && self.send_command(
+            if (force || t.elapsed() >= CPS_DEBOUNCE) && self.repeat_count != self.repeat_last_sent
+            {
+                if !self.send_command(
                     GuiToBackend::SetRepeatCount(self.repeat_count),
                     "set repeat count",
-                )
-            {
+                ) {
+                    return false;
+                }
                 self.repeat_last_sent = self.repeat_count;
                 self.repeat_last_change = None;
             }
         }
+        true
     }
 
     fn send_command(&mut self, command: GuiToBackend, action: &str) -> bool {
-        match ipc::send(command) {
+        #[cfg(not(test))]
+        let result = ipc::send(command);
+        #[cfg(test)]
+        let result = {
+            self.command_log.push(command);
+            if self.fail_commands {
+                Err(std::io::Error::other("Test transport unavailable"))
+            } else {
+                Ok(())
+            }
+        };
+        match result {
             Ok(()) => {
                 self.last_error = None;
                 true
@@ -858,13 +879,19 @@ impl App {
     // -------------------------------------------------------------------------
 
     pub fn toggle(&mut self) {
+        if !self.enabled && !self.flush_pending_settings(true) {
+            return;
+        }
         if self.send_command(GuiToBackend::Toggle, "toggle autoclicking") {
             self.enabled = !self.enabled;
         }
     }
 
     pub fn start(&mut self) {
-        if !self.enabled && self.send_command(GuiToBackend::Start, "start autoclicking") {
+        if !self.enabled
+            && self.flush_pending_settings(true)
+            && self.send_command(GuiToBackend::Start, "start autoclicking")
+        {
             self.enabled = true;
         }
     }
@@ -951,8 +978,21 @@ impl App {
         if count == self.repeat_count {
             return;
         }
+        let mode_changed = (self.repeat_count == 0) != (count == 0);
+        // A discrete mode switch must reach the backend before F6 or Start.
+        // Only numeric edits within fixed-repeat mode need debounce.
+        if mode_changed
+            && !self.send_command(GuiToBackend::SetRepeatCount(count), "set repeat mode")
+        {
+            return;
+        }
         self.repeat_count = count;
-        self.repeat_last_change = Some(Instant::now());
+        if mode_changed {
+            self.repeat_last_sent = count;
+            self.repeat_last_change = None;
+        } else {
+            self.repeat_last_change = Some(Instant::now());
+        }
         self.save_persistent();
     }
 
@@ -1164,7 +1204,7 @@ impl eframe::App for App {
         }
 
         // Flush debounced settings update if deadline passed.
-        self.flush_pending_settings();
+        self.flush_pending_settings(false);
 
         // Window-focused fallback hotkeys (work even when the in-process evdev
         // reader is unavailable, e.g. when the user is not in the `input`
@@ -1230,6 +1270,135 @@ impl eframe::App for App {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    fn test_app(repeat_count: u32) -> App {
+        let persistent = PersistentState {
+            repeat_count,
+            ..Default::default()
+        };
+        let (save_tx, _) = std::sync::mpsc::sync_channel(1);
+        App {
+            enabled: false,
+            cps: persistent.cps,
+            button: persistent.button.clone(),
+            mode: persistent.mode.clone(),
+            randomize: persistent.randomize,
+            jitter_ms: persistent.jitter_ms,
+            repeat_count,
+            autostart: false,
+            dark_mode: true,
+            theme_refresh_needed: false,
+            backend_present: true,
+            hotkeys: HotkeySettings::default(),
+            hotkey_draft: HotkeySettings::default(),
+            show_hotkey_settings: false,
+            last_error: None,
+            inbox: Arc::new(Mutex::new(VecDeque::new())),
+            backend_child: None,
+            backend_pid: Arc::new(AtomicU32::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            global_hotkeys_available: Arc::new(AtomicBool::new(false)),
+            last_socket_check: Instant::now(),
+            save_tx,
+            cps_last_change: None,
+            cps_last_sent: persistent.cps,
+            jitter_last_change: None,
+            jitter_last_sent: persistent.jitter_ms,
+            repeat_last_change: None,
+            repeat_last_sent: repeat_count,
+            persistent,
+            shutdown_requested: false,
+            hotkey_action_pending: None,
+            command_log: Vec::new(),
+            fail_commands: false,
+        }
+    }
+
+    #[test]
+    fn unlimited_selection_reaches_backend_before_immediate_start() {
+        let mut app = test_app(1);
+        app.set_repeat_count(0);
+        app.start();
+        assert!(matches!(
+            app.command_log.as_slice(),
+            [GuiToBackend::SetRepeatCount(0), GuiToBackend::Start]
+        ));
+    }
+
+    #[test]
+    fn unlimited_selection_is_applied_immediately_for_global_hotkeys() {
+        let mut app = test_app(1);
+        app.set_repeat_count(0);
+        assert!(matches!(
+            app.command_log.as_slice(),
+            [GuiToBackend::SetRepeatCount(0)]
+        ));
+    }
+
+    #[test]
+    fn start_flushes_a_pending_fixed_count_without_waiting_for_debounce() {
+        let mut app = test_app(10);
+        app.set_repeat_count(20);
+        app.start();
+        assert!(matches!(
+            app.command_log.as_slice(),
+            [GuiToBackend::SetRepeatCount(20), GuiToBackend::Start]
+        ));
+    }
+
+    #[test]
+    fn focused_toggle_flushes_settings_before_starting() {
+        let mut app = test_app(10);
+        app.set_repeat_count(20);
+        app.toggle();
+        assert!(matches!(
+            app.command_log.as_slice(),
+            [GuiToBackend::SetRepeatCount(20), GuiToBackend::Toggle]
+        ));
+    }
+
+    #[test]
+    fn start_does_not_run_with_stale_settings_after_transport_failure() {
+        let mut app = test_app(10);
+        app.set_repeat_count(20);
+        app.fail_commands = true;
+        app.start();
+        assert!(!app.enabled);
+        assert!(matches!(
+            app.command_log.as_slice(),
+            [GuiToBackend::SetRepeatCount(20)]
+        ));
+    }
+
+    #[test]
+    fn failed_repeat_mode_change_keeps_the_previous_selection() {
+        let mut app = test_app(1);
+        app.fail_commands = true;
+        app.set_repeat_count(0);
+        assert_eq!(app.repeat_count, 1);
+        assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn stopping_does_not_flush_or_wait_for_pending_settings() {
+        let mut app = test_app(10);
+        app.enabled = true;
+        app.set_repeat_count(20);
+        app.toggle();
+        assert!(matches!(app.command_log.as_slice(), [GuiToBackend::Toggle]));
+        assert!(!app.enabled);
+    }
+
+    #[test]
+    fn rendering_unlimited_does_not_turn_the_disabled_count_into_one() {
+        let mut app = test_app(0);
+        let ctx = egui::Context::default();
+        for _ in 0..10 {
+            let _ = ctx.run_ui(Default::default(), |ui| crate::ui::render(&mut app, ui));
+        }
+        assert_eq!(app.repeat_count, 0);
+        assert!(app.command_log.is_empty());
+    }
 
     #[test]
     fn deferred_gui_updates_are_bounded_and_keep_latest_status() {
