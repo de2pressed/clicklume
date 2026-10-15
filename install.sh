@@ -102,6 +102,31 @@ if command -v gnome-extensions >/dev/null 2>&1; then
 fi
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/autoclick-hotkeys@jayant.github.com"
 
+# Old installations registered GNOME shortcuts that invoke the CLI. The
+# passive evdev reader now owns global hotkeys; leaving both active turns one
+# F6 press into Start followed immediately by Stop. Preserve shortcut entries
+# and unrelated commands, clearing only bindings for our exact CLI actions.
+if command -v gsettings >/dev/null 2>&1; then
+    LEGACY_SHORTCUTS="$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null || true)"
+    while IFS= read -r shortcut_path; do
+        shortcut_schema="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$shortcut_path"
+        shortcut_command="$(gsettings get "$shortcut_schema" command 2>/dev/null || true)"
+        case "$shortcut_command" in
+            "'$BIN_DIR/autoclick-cli toggle'"|"'$BIN_DIR/autoclick-cli inc'"|"'$BIN_DIR/autoclick-cli dec'"|"'$BIN_DIR/autoclick-cli quit'"|\
+            "'$BIN_DIR/clicklume-cli toggle'"|"'$BIN_DIR/clicklume-cli inc'"|"'$BIN_DIR/clicklume-cli dec'"|"'$BIN_DIR/clicklume-cli quit'")
+                shortcut_binding="$(gsettings get "$shortcut_schema" binding 2>/dev/null || true)"
+                if [ -n "$shortcut_binding" ] && [ "$shortcut_binding" != "''" ]; then
+                    if gsettings set "$shortcut_schema" binding "''"; then
+                        printf 'Disabled duplicate ClickLume GNOME shortcut: %s\n' "$shortcut_path"
+                    else
+                        printf 'Could not disable duplicate ClickLume shortcut: %s\n' "$shortcut_path" >&2
+                    fi
+                fi
+                ;;
+        esac
+    done < <(printf '%s\n' "$LEGACY_SHORTCUTS" | grep -oE "'/[^']+/'" | tr -d "'" || true)
+fi
+
 if [ "$SKIP_SYSTEM_SETUP" -eq 0 ]; then
     step "Configure Wayland input access"
     run_privileged "uinput udev rule" install -m 0644 \
