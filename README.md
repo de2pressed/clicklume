@@ -77,6 +77,13 @@ Rust stable and the normal Ubuntu desktop development libraries are required.
 Hotkeys are read passively: ClickLume does not grab or suppress the keys, so
 they still reach the focused application.
 
+Older installations may also have GNOME custom shortcuts named AutoClicker
+Toggle, Quit, Increase CPS, and Decrease CPS. These duplicate the built-in
+reader: one F6 press can start clicking and immediately stop it. The user
+installer disables bindings for those exact CLI commands during upgrades,
+while preserving unrelated shortcuts. When upgrading through a `.deb`, clear
+those obsolete bindings in GNOME Keyboard Settings if they are still present.
+
 The command-line client is also available:
 
 ```bash
