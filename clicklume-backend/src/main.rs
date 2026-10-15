@@ -606,12 +606,16 @@ fn change_cps(cps: &AtomicU32, cfg: &config::Config, increase: bool) -> u32 {
             current.saturating_sub(step)
         })
     };
-    let previous = cps
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(next(current))
-        })
-        .unwrap();
-    next(previous)
+    // Use the CAS primitive directly for compatibility with compilers both
+    // before and after fetch_update was renamed to try_update.
+    let mut current = cps.load(Ordering::Relaxed);
+    loop {
+        let updated = next(current);
+        match cps.compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return updated,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[cfg(test)]
