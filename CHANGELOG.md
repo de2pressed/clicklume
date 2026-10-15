@@ -5,6 +5,17 @@ Semantic Versioning after the first public preview.
 
 ## [Unreleased]
 
+### Performance and reliability
+
+- Replace click-worker polling and periodic idle GUI rendering with blocking waits and event-driven updates
+- Bound IPC workers, connection queues, notification frames and background queues
+- Include queue time in IPC read deadlines and disconnect stalled subscribers
+- Reap backend children in one supervisor and recover before the first GUI subscription
+- Join hotplug readers, reconcile late device permissions and avoid stale reader handles
+- Debounce settings writes, preserve newer listener snapshots and restore staged preferences after recovery
+- Remove duplicate input synchronization events and per-click string copies
+- Add resource, overload, cancellation and repeated backend-recovery regression checks
+
 ### Added
 
 - Compact monochrome translucent GUI with persistent light and dark modes

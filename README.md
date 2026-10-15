@@ -25,6 +25,10 @@ hotkeys—no X11 fallback and no root process at runtime.
 - Optional start-on-login user service
 - CLI for scripts and troubleshooting
 
+Idle rendering and click waits are event-driven. IPC concurrency, notification
+buffers and background queues are bounded for sustained use. See the
+[resource audit](PERFORMANCE_AUDIT.md) for limits and verification.
+
 ## Install
 
 ### Ubuntu package

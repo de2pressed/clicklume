@@ -4,11 +4,13 @@
 mod clicker;
 mod config;
 mod hotkeys;
+mod ipc_server;
 
 use anyhow::Result;
 use clicker::{ClickMode, ClickerState};
 use common::{BackendToGui, GuiToBackend};
 use evdev::KeyCode;
+use nix::poll::{poll, PollFd, PollFlags};
 #[allow(unused_imports)]
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,8 +30,8 @@ fn main() -> Result<()> {
 
     log::info!("Starting clicklume-backend v1.0");
 
-    // No root required. /dev/uinput has ACL granting user access; we only
-    // emit synthetic input — never read physical devices. See README.
+    // No root required. /dev/uinput uses an ACL; passive physical-keyboard
+    // reads use the user's input-group permissions. See README.
 
     let _instance_lock = lock_instance()?;
     anyhow::ensure!(
@@ -67,6 +69,7 @@ fn main() -> Result<()> {
         randomize: randomize.clone(),
         jitter_ms: jitter_ms.clone(),
         repeat_count: repeat_count.clone(),
+        wake: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
     };
 
     // (gui_stream declared at the very top so the hotkey drain and accept loop
@@ -119,57 +122,73 @@ fn main() -> Result<()> {
     let hotkey_drain_shutdown = shutdown.clone();
     let hotkey_drain_gui_stream = gui_stream.clone();
     let hotkey_cfg = cfg.clone();
-    std::thread::spawn(move || {
-        log::info!("Hotkey drain thread started");
-        while !hotkey_drain_shutdown.load(Ordering::Relaxed) {
-            match hotkey_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(action) => {
-                    let action_str = match action {
-                        hotkeys::HotkeyAction::Toggle => "toggle",
-                        hotkeys::HotkeyAction::Increase => "increase",
-                        hotkeys::HotkeyAction::Decrease => "decrease",
-                        hotkeys::HotkeyAction::Quit => "quit",
-                    };
-                    // Apply the action to shared state. We duplicate the
-                    // logic that IPC handlers do so the GUI sees consistent
-                    // state via the push below.
-                    match action {
-                        hotkeys::HotkeyAction::Toggle => {
-                            let new_state = !hotkey_drain_state
-                                .enabled
-                                .fetch_xor(true, Ordering::Relaxed);
-                            log::info!(
-                                "Autoclick {} via in-process hotkey",
-                                if new_state { "STARTED" } else { "STOPPED" }
-                            );
+    let hotkey_drain = std::thread::Builder::new()
+        .name("clicklume-hotkey-drain".into())
+        .spawn(move || {
+            log::info!("Hotkey drain thread started");
+            while !hotkey_drain_shutdown.load(Ordering::Relaxed) {
+                match hotkey_rx.recv() {
+                    Ok(action) => {
+                        if hotkey_drain_shutdown.load(Ordering::Relaxed) {
+                            break;
                         }
-                        hotkeys::HotkeyAction::Increase => {
-                            let new_cps = change_cps(&hotkey_drain_state.cps, &hotkey_cfg, true);
-                            log::info!("CPS increased to {} via in-process hotkey", new_cps);
+                        let action_str = match action {
+                            hotkeys::HotkeyAction::Toggle => "toggle",
+                            hotkeys::HotkeyAction::Increase => "increase",
+                            hotkeys::HotkeyAction::Decrease => "decrease",
+                            hotkeys::HotkeyAction::Quit => "quit",
+                        };
+                        // Apply the action to shared state. We duplicate the
+                        // logic that IPC handlers do so the GUI sees consistent
+                        // state via the push below.
+                        match action {
+                            hotkeys::HotkeyAction::Toggle => {
+                                let new_state = !hotkey_drain_state
+                                    .enabled
+                                    .fetch_xor(true, Ordering::Relaxed);
+                                hotkey_drain_state.notify();
+                                log::info!(
+                                    "Autoclick {} via in-process hotkey",
+                                    if new_state { "STARTED" } else { "STOPPED" }
+                                );
+                            }
+                            hotkeys::HotkeyAction::Increase => {
+                                let new_cps =
+                                    change_cps(&hotkey_drain_state.cps, &hotkey_cfg, true);
+                                log::info!("CPS increased to {} via in-process hotkey", new_cps);
+                            }
+                            hotkeys::HotkeyAction::Decrease => {
+                                let new_cps =
+                                    change_cps(&hotkey_drain_state.cps, &hotkey_cfg, false);
+                                log::info!("CPS decreased to {} via in-process hotkey", new_cps);
+                            }
+                            hotkeys::HotkeyAction::Quit => {
+                                log::info!("Quit requested via in-process hotkey");
+                                hotkey_drain_state.enabled.store(false, Ordering::Relaxed);
+                                hotkey_drain_state.notify();
+                            }
                         }
-                        hotkeys::HotkeyAction::Decrease => {
-                            let new_cps = change_cps(&hotkey_drain_state.cps, &hotkey_cfg, false);
-                            log::info!("CPS decreased to {} via in-process hotkey", new_cps);
-                        }
-                        hotkeys::HotkeyAction::Quit => {
-                            log::info!("Quit requested via in-process hotkey");
+                        // Mirror to GUI listener so the window updates without
+                        // the user touching it. The IPC path already does this
+                        // on every command, so we replicate it here.
+                        send_status_from_state_to_gui(
+                            &hotkey_drain_gui_stream,
+                            &hotkey_drain_state,
+                        );
+                        send_hotkey_notification(&hotkey_drain_gui_stream, action_str);
+                        if action == hotkeys::HotkeyAction::Quit {
+                            // Deliver quit before the accept loop closes the
+                            // subscription, or the GUI could mistake EOF for a crash.
                             hotkey_drain_shutdown.store(true, Ordering::Relaxed);
                         }
                     }
-                    // Mirror to GUI listener so the window updates without
-                    // the user touching it. The IPC path already does this
-                    // on every command, so we replicate it here.
-                    send_status_from_state_to_gui(&hotkey_drain_gui_stream, &hotkey_drain_state);
-                    send_hotkey_notification(&hotkey_drain_gui_stream, action_str);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    log::info!("Hotkey channel disconnected; drain thread exiting");
-                    break;
+                    Err(_) => {
+                        log::info!("Hotkey channel disconnected; drain thread exiting");
+                        break;
+                    }
                 }
             }
-        }
-    });
+        })?;
 
     // Remove existing socket files
     let _ = std::fs::remove_file(SOCKET_PATH);
@@ -193,56 +212,74 @@ fn main() -> Result<()> {
     // listener holder thread on EOF so a dead socket never blocks backend
     // pushes (which would otherwise spin or leak FDs).
 
-    // Handle socket connections — one thread per accept so the GUI's
-    // long-lived notification listener can't block one-shot CLI invocations.
-    // Loop exits when shutdown flag is set (via Quit IPC or signal).
+    let connection_state = clicker_state.clone();
+    let connection_gui_stream = gui_stream.clone();
+    let connection_shutdown = shutdown.clone();
+    let connection_hotkeys_available = hotkeys_available.clone();
+    let pool = ipc_server::ConnectionPool::new(move |mut stream, deadline| {
+        if connection_shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+        match read_command(&mut stream, deadline) {
+            Ok(buffer) => {
+                if let Err(e) = handle_connection_with_buffer(
+                    stream,
+                    &buffer,
+                    &connection_state,
+                    connection_gui_stream.clone(),
+                    &connection_shutdown,
+                    &cfg,
+                    &connection_hotkeys_available,
+                ) {
+                    log::debug!("Error handling connection: {}", e);
+                }
+            }
+            Err(e) => log::debug!("Command read failed: {}", e),
+        }
+    })?;
+
+    // Block in poll when idle. Check hotplug availability and Quit at least
+    // once per second; ready connections wake immediately.
     while !shutdown.load(Ordering::Relaxed) {
         let available = hotkey_reader.has_devices();
         if hotkeys_available.swap(available, Ordering::Relaxed) != available {
             send_hotkey_availability(&gui_stream, available);
         }
-        match socket_listener.accept() {
-            Ok((mut stream, _addr)) => {
-                log::info!("Connection received");
-                let clicker_state_clone = clicker_state.clone();
-                let gui_stream_clone = gui_stream.clone();
-                let shutdown_clone = shutdown.clone();
-                let connection_cfg = cfg.clone();
-                let connection_hotkeys_available = hotkeys_available.clone();
-                std::thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                    match read_command(&mut stream) {
-                        Ok(buffer) => {
-                            if let Err(e) = handle_connection_with_buffer(
-                                &stream,
-                                &buffer,
-                                &clicker_state_clone,
-                                gui_stream_clone,
-                                &shutdown_clone,
-                                &connection_cfg,
-                                &connection_hotkeys_available,
-                            ) {
-                                log::debug!("Error handling connection: {}", e);
-                            }
-                        }
-                        Err(e) => log::debug!("Command read failed: {}", e),
-                    }
-                    log::info!("Connection closed");
-                });
+        let mut fds = [PollFd::new(&socket_listener, PollFlags::POLLIN)];
+        match poll(&mut fds, 1000) {
+            Ok(0) => continue,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => {
+                log::error!("Socket poll failed: {}", e);
+                shutdown.store(true, Ordering::Relaxed);
+                break;
             }
+            Ok(_) => {}
+        }
+        match socket_listener.accept() {
+            Ok((stream, _addr)) => pool.submit(stream),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25));
+                continue;
             }
             Err(e) => {
                 log::error!("Connection error: {}", e);
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
 
     // Cleanup
     log::info!("Shutting down...");
+    clicker_state.enabled.store(false, Ordering::Relaxed);
+    clicker_state.notify();
     clicker.stop();
+    if let Some(stream) = gui_stream.lock().unwrap().take() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    drop(pool);
+    hotkey_reader.stop();
+    let _ = hotkey_drain.join();
 
     // Remove socket files
     let _ = std::fs::remove_file(SOCKET_PATH);
@@ -263,8 +300,22 @@ fn socket_identity(stream: &UnixStream) -> std::io::Result<u64> {
 fn send_hotkey_availability(gui_stream: &Arc<Mutex<Option<UnixStream>>>, available: bool) {
     let mut json = serde_json::to_vec(&BackendToGui::HotkeyAvailability(available)).unwrap();
     json.push(b'\n');
-    if let Some(stream) = gui_stream.lock().unwrap().as_mut() {
-        let _ = stream.write_all(&json);
+    push_notification(gui_stream, &json);
+}
+
+fn push_notification(gui_stream: &Arc<Mutex<Option<UnixStream>>>, json: &[u8]) {
+    let mut guard = gui_stream.lock().unwrap();
+    if let Some(stream) = guard.as_mut() {
+        if let Err(error) = stream.write_all(json) {
+            log::debug!(
+                "GUI notification failed: {}; disconnecting subscriber",
+                error
+            );
+            // Dropping only the writer clone leaves the subscription worker
+            // blocked in read forever when a client stops consuming updates.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            *guard = None;
+        }
     }
 }
 
@@ -272,11 +323,7 @@ fn send_hotkey_notification(gui_stream: &Arc<Mutex<Option<UnixStream>>>, action:
     let msg = BackendToGui::HotkeyPressed(action.to_string());
     if let Ok(mut json) = serde_json::to_vec(&msg) {
         json.push(b'\n');
-        if let Ok(mut guard) = gui_stream.lock() {
-            if let Some(ref mut stream) = *guard {
-                let _ = stream.write_all(&json);
-            }
-        }
+        push_notification(gui_stream, &json);
     }
 }
 
@@ -297,25 +344,7 @@ fn send_status_from_state_to_gui(
     match serde_json::to_vec(&msg) {
         Ok(mut json) => {
             json.push(b'\n');
-            match gui_stream.lock() {
-                Ok(mut guard) => {
-                    if let Some(ref mut stream) = *guard {
-                        match stream.write_all(&json) {
-                            Ok(_) => log::info!(
-                                "Pushed full Status to GUI listener ({} bytes)",
-                                json.len()
-                            ),
-                            Err(e) => {
-                                log::debug!("GUI listener write failed: {}; clearing slot", e);
-                                *guard = None;
-                            }
-                        }
-                    } else {
-                        log::info!("No GUI listener registered; skipping full Status push");
-                    }
-                }
-                Err(e) => log::error!("Failed to lock gui_stream mutex: {}", e),
-            }
+            push_notification(gui_stream, &json);
         }
         Err(e) => log::error!("Failed to serialize full Status for GUI listener: {}", e),
     }
@@ -350,7 +379,7 @@ fn send_status_full(stream: &mut UnixStream, state: &ClickerState) -> Result<()>
 }
 
 fn handle_connection_with_buffer(
-    stream: &UnixStream,
+    mut stream: UnixStream,
     buffer: &[u8],
     state: &ClickerState,
     gui_stream_for_hotkey: Arc<Mutex<Option<UnixStream>>>,
@@ -358,8 +387,6 @@ fn handle_connection_with_buffer(
     cfg: &config::Config,
     hotkeys_available: &AtomicBool,
 ) -> Result<()> {
-    let mut stream = stream.try_clone()?;
-
     // Parse message
     let msg: GuiToBackend = match serde_json::from_slice(buffer) {
         Ok(msg) => msg,
@@ -369,24 +396,32 @@ fn handle_connection_with_buffer(
         }
     };
 
+    anyhow::ensure!(
+        !shutdown.load(Ordering::Relaxed),
+        "Backend is shutting down"
+    );
+
     log::debug!("Received message: {:?}", msg);
 
     // Handle message
     match msg {
         GuiToBackend::Start => {
             state.enabled.store(true, Ordering::Relaxed);
+            state.notify();
             log::info!("Autoclick STARTED via GUI");
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::Stop => {
             state.enabled.store(false, Ordering::Relaxed);
+            state.notify();
             log::info!("Autoclick STOPPED via GUI");
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
         GuiToBackend::Toggle => {
             let new_state = !state.enabled.fetch_xor(true, Ordering::Relaxed);
+            state.notify();
             log::info!(
                 "Autoclick {} via IPC toggle",
                 if new_state { "STARTED" } else { "STOPPED" }
@@ -397,7 +432,7 @@ fn handle_connection_with_buffer(
         GuiToBackend::SetCps(new_cps) => {
             let new_cps = cfg.clamp_cps(new_cps);
             state.cps.store(new_cps, Ordering::Relaxed);
-            log::info!("CPS set to {} via GUI", new_cps);
+            log::debug!("CPS set to {} via GUI", new_cps);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
@@ -438,7 +473,7 @@ fn handle_connection_with_buffer(
         }
         GuiToBackend::SetJitterMs(jitter) => {
             state.jitter_ms.store(jitter.min(100), Ordering::Relaxed);
-            log::info!("Jitter set to {}ms via GUI", jitter);
+            log::debug!("Jitter set to {}ms via GUI", jitter);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
@@ -446,7 +481,7 @@ fn handle_connection_with_buffer(
             state
                 .repeat_count
                 .store(count.min(1_000_000), Ordering::Relaxed);
-            log::info!("Repeat count set to {} via GUI", count);
+            log::debug!("Repeat count set to {} via GUI", count);
             send_status_full(&mut stream, state)?;
             send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
         }
@@ -461,6 +496,10 @@ fn handle_connection_with_buffer(
             let cloned_for_writes = stream.try_clone()?;
             {
                 let mut guard = gui_stream_for_hotkey.lock().unwrap();
+                anyhow::ensure!(
+                    !shutdown.load(Ordering::Relaxed),
+                    "Backend is shutting down"
+                );
                 if guard.is_some() {
                     return Err(anyhow::anyhow!("A GUI is already subscribed"));
                 }
@@ -470,17 +509,15 @@ fn handle_connection_with_buffer(
                 &gui_stream_for_hotkey,
                 hotkeys_available.load(Ordering::Relaxed),
             );
+            send_status_from_state_to_gui(&gui_stream_for_hotkey, state);
             log::info!("Registered GUI notification listener");
 
             // Keep this handler alive until the GUI disconnects. Backend status
             // pushes use the cloned stream stored above; this original stream is
             // just the lifetime guard for the subscription.
-            let mut sink = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut sink) {
-                if n == 0 {
-                    break;
-                }
-            }
+            // Subscribers never send more commands on this connection. A
+            // single read detects EOF or rejects unsolicited stream flooding.
+            let _ = stream.read(&mut [0u8; 1]);
             if let Ok(mut guard) = gui_stream_for_hotkey.lock() {
                 if guard.as_ref().and_then(|s| socket_identity(s).ok()) == Some(subscription_id) {
                     let _ = guard.take();
@@ -491,6 +528,8 @@ fn handle_connection_with_buffer(
         }
         GuiToBackend::Quit => {
             log::info!("Quit requested via GUI");
+            state.enabled.store(false, Ordering::Relaxed);
+            state.notify();
             // send_status may fail with broken pipe if the GUI already
             // closed its end after sending Quit — that's fine, the GUI is
             // exiting too. Ignore the result and proceed with shutdown.
@@ -533,16 +572,19 @@ fn lock_instance() -> Result<std::fs::File> {
 }
 
 /// Unix streams may split even tiny JSON commands across multiple reads.
-fn read_command(stream: &mut UnixStream) -> Result<Vec<u8>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+fn read_command(stream: &mut UnixStream, deadline: std::time::Instant) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     loop {
         anyhow::ensure!(buffer.len() < 4096, "Command exceeds 4096 bytes");
         anyhow::ensure!(std::time::Instant::now() < deadline, "Command timed out");
+        stream.set_read_timeout(Some(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ))?;
         let mut chunk = [0; 256];
         let n = stream.read(&mut chunk)?;
         anyhow::ensure!(n > 0, "Connection closed before a complete command");
         buffer.extend_from_slice(&chunk[..n]);
+        anyhow::ensure!(buffer.len() <= 4096, "Command exceeds 4096 bytes");
         match serde_json::from_slice::<GuiToBackend>(&buffer) {
             Ok(_) => return Ok(buffer),
             Err(e) if e.is_eof() => continue,
@@ -608,9 +650,25 @@ mod ipc_tests {
             writer.write_all(b"42}").unwrap();
         });
         assert!(matches!(
-            serde_json::from_slice::<GuiToBackend>(&read_command(&mut reader).unwrap()).unwrap(),
+            serde_json::from_slice::<GuiToBackend>(
+                &read_command(
+                    &mut reader,
+                    std::time::Instant::now() + Duration::from_secs(1)
+                )
+                .unwrap()
+            )
+            .unwrap(),
             GuiToBackend::SetCps(42)
         ));
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_command_has_a_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"{\"SetCps\":").unwrap();
+        let start = std::time::Instant::now();
+        assert!(read_command(&mut reader, start + Duration::from_secs(1)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

@@ -8,20 +8,17 @@ use crate::state::{self, PersistentState};
 use common::{BackendToGui, GuiToBackend};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-extern "C" {
-    fn shutdown(fd: RawFd, how: libc::c_int) -> libc::c_int;
-}
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const CPS_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -180,7 +177,7 @@ extern "C" fn sigterm_handler(_sig: i32) {
 }
 
 fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
     let mut pipefds = [0i32; 2];
     let r = unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC) };
     if r != 0 {
@@ -209,7 +206,7 @@ fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
             match f.read(&mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if tx.send(()).is_err() {
+                    if matches!(tx.try_send(()), Err(mpsc::TrySendError::Disconnected(_))) {
                         break;
                     }
                     ctx.request_repaint();
@@ -270,8 +267,47 @@ enum GuiEvent {
     Disconnected,
 }
 
+type GuiInbox = Arc<Mutex<VecDeque<GuiEvent>>>;
+
+fn queue_event(inbox: &GuiInbox, event: GuiEvent) {
+    let mut queue = inbox.lock().unwrap();
+    // One latest event per protocol variant (at most six slots), even when
+    // Wayland defers a minimized window's event loop for hours.
+    queue.retain(|old| match (old, &event) {
+        (GuiEvent::Backend(a), GuiEvent::Backend(b)) => {
+            std::mem::discriminant(a) != std::mem::discriminant(b)
+        }
+        (GuiEvent::Disconnected, GuiEvent::Disconnected) => false,
+        _ => true,
+    });
+    queue.push_back(event);
+}
+
+fn read_notification(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<BackendToGui>> {
+    const MAX_NOTIFICATION_BYTES: u64 = 4096;
+    line.clear();
+    let count = reader
+        .take(MAX_NOTIFICATION_BYTES + 1)
+        .read_until(b'\n', line)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if count as u64 > MAX_NOTIFICATION_BYTES || !line.ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Oversized or incomplete backend notification",
+        ));
+    }
+    serde_json::from_slice(line)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn sync_persisted_backend_settings() {
-    let settings = state::load();
+    let settings = state::current_snapshot();
     let commands = [
         GuiToBackend::SetMode(settings.mode),
         GuiToBackend::SetButton(settings.button),
@@ -338,18 +374,36 @@ fn spawn_supervised_backend(backend_pid: &AtomicU32) -> Option<std::process::Chi
 }
 
 fn listen_for_notifications(
-    tx: Sender<GuiEvent>,
+    inbox: GuiInbox,
     ctx: egui::Context,
     backend_pid: Arc<AtomicU32>,
     shutting_down: Arc<AtomicBool>,
     global_hotkeys_available: Arc<AtomicBool>,
+    save_tx: SyncSender<()>,
+    mut supervised_child: Option<std::process::Child>,
 ) {
     let mut backoff_ms: u64 = 100;
-    let mut supervised_child: Option<std::process::Child> = None;
     loop {
+        // This thread owns and reaps every backend Child, including the first
+        // startup. Recovery never depends on a native window repaint.
+        if let Some(child) = supervised_child.as_mut() {
+            let exited = match child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    log::warn!("Could not reap backend: {}", error);
+                    error.raw_os_error() == Some(libc::ECHILD)
+                }
+            };
+            if exited {
+                backend_pid.store(0, Ordering::Release);
+                supervised_child = None;
+            }
+        }
         if let Ok(mut stream) = UnixStream::connect(ipc::SOCKET_PATH) {
             let subscribe = serde_json::to_vec(&GuiToBackend::SubscribeGui)
                 .expect("SubscribeGui must serialize");
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
             if let Err(e) = stream.write_all(&subscribe) {
                 log::warn!("GUI listener failed to subscribe: {}", e);
                 thread::sleep(Duration::from_millis(backoff_ms));
@@ -358,65 +412,57 @@ fn listen_for_notifications(
             }
 
             log::info!("GUI listener subscribed to backend");
-            backoff_ms = 100;
-            let mut buffer = [0u8; 4096];
-            let mut pending = Vec::new();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
             loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => {
+                match read_notification(&mut reader, &mut line) {
+                    Ok(None) => {
                         log::info!("GUI listener EOF");
                         break;
                     }
-                    Ok(n) => {
-                        pending.extend_from_slice(&buffer[..n]);
-                        while let Some(newline_idx) = pending.iter().position(|&b| b == b'\n') {
-                            let line: Vec<u8> = pending.drain(..=newline_idx).collect();
-                            let line = &line[..line.len() - 1];
-                            match serde_json::from_slice::<BackendToGui>(line) {
-                                Ok(msg) => {
-                                    log::info!("GUI listener parsed: {:?}", msg);
-                                    match &msg {
-                                        BackendToGui::HotkeyAvailability(available) => {
-                                            global_hotkeys_available
-                                                .store(*available, Ordering::Release);
-                                        }
-                                        BackendToGui::HotkeyPressed(action) if action == "quit" => {
-                                            // GNOME can defer an idle/minimized Wayland window's
-                                            // next native event-loop pass indefinitely, so a
-                                            // ViewportCommand::Close is not reliable here. The
-                                            // backend has already persisted its final Status and
-                                            // started shutdown. Exit successfully so systemd's
-                                            // Restart=on-failure does not reopen the application.
-                                            // Do not run process-wide exit handlers from this
-                                            // background thread: graphics teardown races the
-                                            // renderer and can fault. POSIX _exit is atomic and
-                                            // the kernel owns all remaining resource cleanup.
-                                            unsafe { libc::_exit(0) };
-                                        }
-                                        BackendToGui::Status {
-                                            cps,
-                                            button,
-                                            mode,
-                                            randomize,
-                                            jitter_ms,
-                                            repeat_count,
-                                            ..
-                                        } => state::merge_backend_settings(
-                                            *cps,
-                                            button.clone(),
-                                            mode.clone(),
-                                            *randomize,
-                                            *jitter_ms,
-                                            *repeat_count,
-                                        ),
-                                        _ => {}
-                                    }
-                                    let _ = tx.send(GuiEvent::Backend(msg));
-                                    ctx.request_repaint();
-                                }
-                                Err(e) => log::warn!("GUI listener parse error: {}", e),
+                    Ok(Some(msg)) => {
+                        backoff_ms = 100;
+                        log::debug!("GUI listener parsed: {:?}", msg);
+                        match &msg {
+                            BackendToGui::HotkeyAvailability(available) => {
+                                global_hotkeys_available.store(*available, Ordering::Release);
                             }
+                            BackendToGui::HotkeyPressed(action) if action == "quit" => {
+                                shutting_down.store(true, Ordering::Release);
+                                state::flush();
+                                // GNOME can defer an idle/minimized Wayland window's
+                                // next native event-loop pass indefinitely, so a
+                                // ViewportCommand::Close is not reliable here. The
+                                // backend has already persisted its final Status and
+                                // started shutdown. Exit successfully so systemd's
+                                // Restart=on-failure does not reopen the application.
+                                // Do not run process-wide exit handlers from this
+                                // background thread: graphics teardown races the
+                                // renderer and can fault. POSIX _exit is atomic and
+                                // the kernel owns all remaining resource cleanup.
+                                unsafe { libc::_exit(0) };
+                            }
+                            BackendToGui::Status {
+                                cps,
+                                button,
+                                mode,
+                                randomize,
+                                jitter_ms,
+                                repeat_count,
+                                ..
+                            } => state::merge_backend_settings(
+                                &save_tx,
+                                *cps,
+                                button.clone(),
+                                mode.clone(),
+                                *randomize,
+                                *jitter_ms,
+                                *repeat_count,
+                            ),
+                            _ => {}
                         }
+                        queue_event(&inbox, GuiEvent::Backend(msg));
+                        ctx.request_repaint();
                     }
                     Err(e) => {
                         log::warn!("GUI listener read error: {}", e);
@@ -424,37 +470,13 @@ fn listen_for_notifications(
                     }
                 }
             }
-            // EOF can arrive just before a cleanly quitting child becomes
-            // waitable. A release build may consume the repaint while the
-            // socket still looks alive, then go idle. Briefly wait/reap here
-            // so the disconnect event reaches the UI at a deterministic point.
-            if let Some(mut child) = supervised_child.take() {
-                let _ = child.wait();
-            } else {
-                let pid = backend_pid.load(Ordering::Acquire) as libc::pid_t;
-                let mut status = 0;
-                if pid > 0 && pid != u32::MAX as libc::pid_t {
-                    for _ in 0..60 {
-                        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                        if result == pid || result == -1 {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            }
-            backend_pid.store(0, Ordering::Release);
             global_hotkeys_available.store(false, Ordering::Release);
-            let _ = tx.send(GuiEvent::Disconnected);
+            queue_event(&inbox, GuiEvent::Disconnected);
             ctx.request_repaint();
-            if !shutting_down.load(Ordering::Acquire) {
-                log::info!("Backend listener supervising restart");
-                supervised_child = spawn_supervised_backend(&backend_pid);
-            }
+        } else if supervised_child.is_none() && !shutting_down.load(Ordering::Acquire) {
+            supervised_child = spawn_supervised_backend(&backend_pid);
         }
-        // A failed reconnect means the backend is still absent. Wake the UI
-        // on every backoff step so lifecycle polling can reap and respawn the
-        // child even when the release event loop is otherwise completely idle.
+        // Retry only while disconnected, with bounded exponential backoff.
         ctx.request_repaint();
         thread::sleep(Duration::from_millis(backoff_ms));
         backoff_ms = (backoff_ms * 2).min(2000);
@@ -483,7 +505,7 @@ pub struct App {
     pub show_hotkey_settings: bool,
     pub last_error: Option<String>,
 
-    hotkey_rx: Option<Receiver<GuiEvent>>,
+    inbox: GuiInbox,
     sig_rx: Option<Receiver<()>>,
     backend_child: Option<std::process::Child>,
     backend_pid: Arc<AtomicU32>,
@@ -492,7 +514,7 @@ pub struct App {
     last_socket_check: Instant,
 
     persistent: PersistentState,
-    save_tx: Sender<()>,
+    save_tx: SyncSender<()>,
 
     cps_last_change: Option<Instant>,
     cps_last_sent: u32,
@@ -512,7 +534,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let (tx, rx) = mpsc::channel::<GuiEvent>();
+        let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let listener_ctx = cc.egui_ctx.clone();
         let backend_pid = Arc::new(AtomicU32::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -520,15 +542,6 @@ impl App {
         let listener_shutting_down = Arc::clone(&shutting_down);
         let global_hotkeys_available = Arc::new(AtomicBool::new(false));
         let listener_hotkeys_available = global_hotkeys_available.clone();
-        thread::spawn(move || {
-            listen_for_notifications(
-                tx,
-                listener_ctx,
-                listener_backend_pid,
-                listener_shutting_down,
-                listener_hotkeys_available,
-            )
-        });
 
         let sig_rx = install_signal_handler(cc.egui_ctx.clone());
 
@@ -559,7 +572,7 @@ impl App {
             hotkey_draft: HotkeySettings::default(),
             show_hotkey_settings: false,
             last_error: None,
-            hotkey_rx: Some(rx),
+            inbox: inbox.clone(),
             sig_rx: Some(sig_rx),
             backend_child: None,
             backend_pid,
@@ -604,6 +617,22 @@ impl App {
         if app.backend_present {
             app.sync_backend_settings();
         }
+
+        // Initialize persistence and startup settings before the listener can
+        // stage backend snapshots; startup must not overwrite a newer update.
+        let listener_save_tx = app.save_tx.clone();
+        let initial_child = app.backend_child.take();
+        thread::spawn(move || {
+            listen_for_notifications(
+                inbox,
+                listener_ctx,
+                listener_backend_pid,
+                listener_shutting_down,
+                listener_hotkeys_available,
+                listener_save_tx,
+                initial_child,
+            )
+        });
 
         app
     }
@@ -653,6 +682,18 @@ impl App {
     }
 
     fn flush_pending_settings(&mut self) {
+        if self.cps == self.cps_last_sent {
+            self.cps_last_change = None;
+        }
+        if self.jitter_ms == self.jitter_last_sent {
+            self.jitter_last_change = None;
+        }
+        if self.repeat_count == self.repeat_last_sent {
+            self.repeat_last_change = None;
+        }
+        if !self.backend_present {
+            return;
+        }
         if let Some(t) = self.cps_last_change {
             if t.elapsed() >= CPS_DEBOUNCE
                 && self.cps != self.cps_last_sent
@@ -967,22 +1008,7 @@ impl App {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let socket_alive = UnixStream::connect(ipc::SOCKET_PATH).is_ok();
-            let child_alive = match self.backend_child.as_mut() {
-                Some(child) => match child.try_wait() {
-                    Ok(Some(status)) => {
-                        log::info!("Backend stopped for hotkey reload: {}", status);
-                        self.backend_child = None;
-                        self.backend_pid.store(0, Ordering::Release);
-                        false
-                    }
-                    Ok(None) => true,
-                    Err(e) => {
-                        log::warn!("Could not wait for backend during hotkey reload: {}", e);
-                        false
-                    }
-                },
-                None => false,
-            };
+            let child_alive = self.backend_pid.load(Ordering::Acquire) != 0;
             if !socket_alive && !child_alive {
                 break;
             }
@@ -992,7 +1018,9 @@ impl App {
             thread::sleep(Duration::from_millis(50));
         }
 
-        if UnixStream::connect(ipc::SOCKET_PATH).is_ok() || self.backend_child.is_some() {
+        if UnixStream::connect(ipc::SOCKET_PATH).is_ok()
+            || self.backend_pid.load(Ordering::Acquire) != 0
+        {
             self.shutting_down.store(false, Ordering::Release);
             self.backend_present = false;
             self.last_error = Some(
@@ -1007,10 +1035,7 @@ impl App {
         // This Quit only reloads the child backend; the application itself is
         // staying open and should resume normal crash recovery afterwards.
         self.shutdown_requested = false;
-        self.spawn_backend();
-        if self.backend_present {
-            self.sync_backend_settings();
-        }
+        // The listener resumes supervision and restores the staged settings.
         true
     }
 }
@@ -1020,19 +1045,10 @@ impl eframe::App for App {
         log::info!("GUI exiting — sending Quit to backend");
         self.quit();
         state::flush();
-        if let Some(mut child) = self.backend_child.take() {
-            let waiter = thread::spawn(move || {
-                let _ = child.wait();
-            });
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !waiter.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(20));
-            }
+        let deadline = Instant::now() + SOCKET_WAIT_TIMEOUT;
+        while self.backend_pid.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
         }
-        // A service stop can terminate the backend just after it handled
-        // Quit, leaving only the pathname behind. Remove that stale marker so
-        // the next launch never mistakes it for a live backend.
-        thread::sleep(Duration::from_millis(500));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1040,9 +1056,8 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Backend presence poll (1Hz). Use a connect-side shutdown so the
-        // probe fd closes immediately — otherwise we leak short-lived
-        // listener-handling threads on the backend every second.
+        // Check presence at most once a second when logic is already awake.
+        // Healthy idle windows rely on listener-driven lifecycle supervision.
         if self.last_socket_check.elapsed() >= SOCKET_POLL_INTERVAL {
             self.last_socket_check = Instant::now();
             self.backend_present = if let Ok(stream) = UnixStream::connect(ipc::SOCKET_PATH) {
@@ -1050,59 +1065,20 @@ impl eframe::App for App {
                 // the moment we release the fd, so the backend's per-accept
                 // thread sees EOF and tears down without us keeping an open
                 // "is the socket alive?" socket open for a full second.
-                let _ = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
-                unsafe {
-                    shutdown(stream.as_raw_fd(), libc::SHUT_RDWR);
-                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 true
             } else {
                 false
             };
 
-            if let Some(child) = self.backend_child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        log::info!("Backend child exited (status={}); clearing handle", status);
-                        self.backend_child = None;
-                        self.backend_pid.store(0, Ordering::Release);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!("try_wait on backend child failed: {}", e);
-                        self.backend_child = None;
-                    }
-                }
-            }
-
-            if !self.backend_present && !self.shutdown_requested {
-                if self.enabled {
-                    log::warn!("Backend socket became unreachable, stopping autoclicker");
-                    self.enabled = false;
-                }
-                // A SIGKILL'd child can briefly report Ok(None) from
-                // try_wait even though its socket has already disappeared.
-                // Never overwrite that Child handle: doing so loses the only
-                // way to reap it and leaves a zombie behind. Wait for the next
-                // poll to observe/reap the exit, then respawn.
-                if self.backend_child.is_none() {
-                    log::info!("Backend absent — auto-respawning");
-                    self.spawn_backend();
-                    if self.backend_present {
-                        self.sync_backend_settings();
-                    }
-                } else {
-                    log::info!("Backend socket absent; waiting to reap child before respawn");
-                }
+            if !self.backend_present {
+                self.enabled = false;
             }
         }
 
         // Drain backend notifications.
         let mut actions = Vec::new();
-        if let Some(ref mut rx) = self.hotkey_rx {
-            while let Ok(msg) = rx.try_recv() {
-                actions.push(msg);
-            }
-        }
+        actions.extend(self.inbox.lock().unwrap().drain(..));
         for event in actions {
             let msg = match event {
                 GuiEvent::Backend(msg) => msg,
@@ -1140,28 +1116,36 @@ impl eframe::App for App {
                     jitter_ms,
                     repeat_count,
                 } => {
-                    log::info!(
+                    self.backend_present = true;
+                    log::debug!(
                         "GUI received Status: enabled={} cps={} button={} mode={} randomize={} jitter_ms={} repeat_count={}",
                         enabled, cps, button, mode, randomize, jitter_ms, repeat_count
                     );
-                    let settings_changed = self.cps != cps
-                        || self.button != button
-                        || self.mode != mode
-                        || self.randomize != randomize
-                        || self.jitter_ms != jitter_ms
-                        || self.repeat_count != repeat_count;
                     self.enabled = enabled;
-                    self.cps = cps;
+                    if self.cps_last_change.is_none() {
+                        self.cps = cps;
+                        self.cps_last_sent = cps;
+                    }
                     self.button = button;
                     self.mode = mode;
                     self.randomize = randomize;
-                    self.jitter_ms = jitter_ms;
-                    self.repeat_count = repeat_count;
-                    if settings_changed {
-                        // Backend-owned global hotkeys bypass the GUI setters,
-                        // so persist the resulting status here as well.
-                        self.save_persistent();
+                    if self.jitter_last_change.is_none() {
+                        self.jitter_ms = jitter_ms;
+                        self.jitter_last_sent = jitter_ms;
                     }
+                    if self.repeat_last_change.is_none() {
+                        self.repeat_count = repeat_count;
+                        self.repeat_last_sent = repeat_count;
+                    }
+                    // The listener already staged this status. Updating only
+                    // our comparison baseline avoids writing a delayed GUI
+                    // event over a newer listener snapshot or saving twice.
+                    self.persistent.cps = cps;
+                    self.persistent.button = self.button.clone();
+                    self.persistent.mode = self.mode.clone();
+                    self.persistent.randomize = randomize;
+                    self.persistent.jitter_ms = jitter_ms;
+                    self.persistent.repeat_count = repeat_count;
                 }
                 BackendToGui::HotkeyAvailability(_) => {}
                 BackendToGui::Ready => {
@@ -1225,6 +1209,82 @@ impl eframe::App for App {
             }
         }
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // A healthy idle window needs no timer-driven rendering. The listener
+        // supervises backend exits independently and wakes us for new status;
+        // input and the signal pipe also request their own repaint. Keep a
+        // fallback timer only while recovering a missing backend.
+        if !self.backend_present {
+            ctx.request_repaint_after(SOCKET_POLL_INTERVAL);
+        }
+        if self.backend_present {
+            for changed in [
+                self.cps_last_change,
+                self.jitter_last_change,
+                self.repeat_last_change,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ctx.request_repaint_after(
+                    CPS_DEBOUNCE
+                        .saturating_sub(changed.elapsed())
+                        .max(Duration::from_millis(1)),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_gui_updates_are_bounded_and_keep_latest_status() {
+        let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        for cps in 1..=100_000 {
+            queue_event(
+                &inbox,
+                GuiEvent::Backend(BackendToGui::Status {
+                    enabled: false,
+                    cps,
+                    button: "left".into(),
+                    mode: "single".into(),
+                    randomize: false,
+                    jitter_ms: 0,
+                    repeat_count: 0,
+                }),
+            );
+            queue_event(
+                &inbox,
+                GuiEvent::Backend(BackendToGui::HotkeyPressed("increase".into())),
+            );
+        }
+        let queue = inbox.lock().unwrap();
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(
+            queue.front(),
+            Some(GuiEvent::Backend(BackendToGui::Status { cps: 100_000, .. }))
+        ));
+    }
+
+    #[test]
+    fn oversized_and_unterminated_notifications_are_rejected() {
+        let mut line = Vec::new();
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 100_000]);
+        assert!(read_notification(&mut oversized, &mut line).is_err());
+        assert_eq!(line.len(), 4097);
+        let mut incomplete = std::io::Cursor::new(b"\"Ready\"");
+        assert!(read_notification(&mut incomplete, &mut line).is_err());
+        let mut valid = std::io::Cursor::new(b"\"Ready\"\n\"Ready\"\n");
+        assert!(matches!(
+            read_notification(&mut valid, &mut line),
+            Ok(Some(BackendToGui::Ready))
+        ));
+        assert!(matches!(
+            read_notification(&mut valid, &mut line),
+            Ok(Some(BackendToGui::Ready))
+        ));
+        assert!(read_notification(&mut valid, &mut line).unwrap().is_none());
     }
 }

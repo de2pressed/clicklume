@@ -92,6 +92,7 @@ with tempfile.TemporaryDirectory(prefix='clicklume-smoke-') as temporary:
             subscriber.sendall(json.dumps('SubscribeGui').encode())
             reader = subscriber.makefile('rb')
             assert 'HotkeyAvailability' in json.loads(reader.readline())
+            assert json.loads(reader.readline())['Status']['cps'] == 19
             # Health probes must not steal the long-lived subscription.
             for _ in range(3):
                 with connect():
@@ -122,12 +123,21 @@ with tempfile.TemporaryDirectory(prefix='clicklume-smoke-') as temporary:
             pid = wait_for(lambda: backend_pid(gui))
             os.kill(pid, signal.SIGKILL)
             wait_for(lambda: backend_pid(gui) not in (None, pid))
+            assert not (Path('/proc') / str(pid)).exists(), 'Previous backend was not reaped'
             wait_for(lambda: request('GetStatus'))
             pid = wait_for(lambda: backend_pid(gui))
             request('Quit')
             wait_for(lambda: backend_pid(gui) not in (None, pid))
             wait_for(lambda: request('GetStatus'))
             assert gui.poll() is None
+            # Recovery must stay independent of native repaint timers, even
+            # across repeated crashes after the supervisor owns replacement children.
+            for _ in range(4):
+                pid = wait_for(lambda: backend_pid(gui))
+                os.kill(pid, signal.SIGKILL)
+                wait_for(lambda: backend_pid(gui) not in (None, pid))
+                assert not (Path('/proc') / str(pid)).exists(), 'Previous backend was not reaped'
+                assert not wait_for(lambda: request('GetStatus'))['enabled']
             gui.send_signal(signal.SIGINT)
             assert gui.wait(timeout=8) == 0
             wait_for(lambda: not Path(SOCKET).exists())

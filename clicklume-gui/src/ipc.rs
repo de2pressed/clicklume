@@ -2,7 +2,7 @@
 //!
 //! All commands are JSON-encoded and sent over the same `/tmp/clicklume.sock`
 //! Unix domain socket the backend already speaks. Two flavors:
-//!   - `send` — fire-and-forget on a detached thread (use in normal UI flow)
+//!   - `send` — synchronous command with a bounded acknowledgement timeout
 //!   - `send_blocking` — synchronous, used during shutdown so the message
 //!     actually lands before the process tears down
 
