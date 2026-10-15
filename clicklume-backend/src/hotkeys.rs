@@ -17,10 +17,10 @@ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotkeyAction {
@@ -237,6 +237,7 @@ impl WatchedDevice {
     fn open(path: PathBuf) -> Result<Self> {
         let name = device_name_for(&path);
         let dev = Device::open(&path).with_context(|| format!("open({})", path.display()))?;
+        dev.set_nonblocking(true)?;
         log::info!("Watching hotkeys on {} ({})", path.display(), name);
         Ok(Self { dev, path, name })
     }
@@ -255,7 +256,7 @@ impl HotkeyReader {
         decrease: KeyCode,
         quit: KeyCode,
     ) -> Result<(Self, Receiver<HotkeyAction>)> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(64);
         let running = Arc::new(AtomicBool::new(true));
         let active_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let hotkeys = [toggle, increase, decrease, quit];
@@ -274,6 +275,7 @@ impl HotkeyReader {
             &mut reader.threads,
         );
 
+        let mut device_threads = std::mem::take(&mut reader.threads);
         let monitor_handle = thread::Builder::new()
             .name("clicklume-hotkey-monitor".into())
             .spawn(move || {
@@ -282,7 +284,7 @@ impl HotkeyReader {
                 // Event-driven hotplug: watch /dev/input for newly created device nodes
                 let inotify = match Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK) {
                     Ok(inotify) => {
-                        match inotify.add_watch("/dev/input", AddWatchFlags::IN_CREATE) {
+                        match inotify.add_watch("/dev/input", AddWatchFlags::IN_CREATE | AddWatchFlags::IN_ATTRIB) {
                             Ok(_) => {
                                 log::info!("Inotify watch active on /dev/input (event-driven hotplug)");
                                 Some(inotify)
@@ -305,7 +307,15 @@ impl HotkeyReader {
                     }
                 };
 
+                let mut last_scan = Instant::now();
                 while running.load(Ordering::Relaxed) {
+                    reap_finished(&mut device_threads);
+                    // Reconcile periodically too: permissions can settle after
+                    // IN_CREATE, or an event node can be reused during unplug.
+                    if last_scan.elapsed() >= Duration::from_secs(5) {
+                        rescan_and_spawn(&hotkeys, tx.clone(), running.clone(), active_paths.clone(), &mut device_threads);
+                        last_scan = Instant::now();
+                    }
                     if let Some(ref inotify) = inotify {
                         let mut poll_fds = [PollFd::new(inotify, PollFlags::POLLIN)];
                         match poll(&mut poll_fds, 1000) {
@@ -321,17 +331,14 @@ impl HotkeyReader {
                                         thread::sleep(Duration::from_millis(300));
                                         let _ = inotify.read_events();
 
-                                        let mut detached = Vec::new();
                                         rescan_and_spawn(
                                             &hotkeys,
                                             tx.clone(),
                                             running.clone(),
                                             active_paths.clone(),
-                                            &mut detached,
+                                            &mut device_threads,
                                         );
-                                        for handle in detached {
-                                            drop(handle);
-                                        }
+                                        last_scan = Instant::now();
                                     }
                                 }
                             }
@@ -348,19 +355,11 @@ impl HotkeyReader {
                         }
                     } else {
                         // Fallback slow poll if inotify is unavailable
-                        thread::sleep(Duration::from_secs(5));
-                        let mut detached = Vec::new();
-                        rescan_and_spawn(
-                            &hotkeys,
-                            tx.clone(),
-                            running.clone(),
-                            active_paths.clone(),
-                            &mut detached,
-                        );
-                        for handle in detached {
-                            drop(handle);
-                        }
+                        thread::sleep(Duration::from_secs(1));
                     }
+                }
+                for handle in device_threads {
+                    let _ = handle.join();
                 }
                 log::info!("Hotkey monitor thread stopped");
             })
@@ -383,12 +382,15 @@ impl HotkeyReader {
 impl Drop for HotkeyReader {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        for handle in self.threads.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
 fn rescan_and_spawn(
     hotkeys: &[KeyCode; 4],
-    tx: Sender<HotkeyAction>,
+    tx: SyncSender<HotkeyAction>,
     running: Arc<AtomicBool>,
     active_paths: Arc<Mutex<HashSet<PathBuf>>>,
     handles: &mut Vec<thread::JoinHandle<()>>,
@@ -445,7 +447,7 @@ fn rescan_and_spawn(
 
 fn reader_thread(
     mut dev: WatchedDevice,
-    tx: Sender<HotkeyAction>,
+    tx: SyncSender<HotkeyAction>,
     running: Arc<AtomicBool>,
     hotkeys: [KeyCode; 4],
 ) {
@@ -455,6 +457,25 @@ fn reader_thread(
         dev.name
     );
     while running.load(Ordering::Relaxed) {
+        // poll bounds shutdown latency and prevents WouldBlock from spinning.
+        let mut fds = [PollFd::new(&dev.dev, PollFlags::POLLIN)];
+        match poll(&mut fds, 1000) {
+            Ok(0) => continue,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => {
+                log::warn!("Keyboard poll failed: {}", e);
+                break;
+            }
+            Ok(_) => {
+                if fds[0]
+                    .revents()
+                    .unwrap_or(PollFlags::empty())
+                    .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+                {
+                    break;
+                }
+            }
+        }
         match dev.dev.fetch_events() {
             Ok(events) => {
                 for event in events {
@@ -470,9 +491,12 @@ fn reader_thread(
                                 dev.path.display(),
                                 dev.name
                             );
-                            if tx.send(action).is_err() {
-                                log::warn!("Hotkey receiver dropped; exiting reader thread");
-                                return;
+                            match tx.try_send(action) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    log::debug!("Hotkey queue full; dropping excess input")
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => return,
                             }
                         }
                     }
@@ -500,6 +524,17 @@ fn reader_thread(
         dev.path.display(),
         dev.name
     );
+}
+
+fn reap_finished(handles: &mut Vec<thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handles.len() {
+        if handles[index].is_finished() {
+            let _ = handles.swap_remove(index).join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 #[cfg(test)]

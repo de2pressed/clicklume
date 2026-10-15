@@ -7,19 +7,20 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const STATE_DIR: &str = "clicklume";
 const LEGACY_STATE_DIR: &str = "autoclick";
 const STATE_FILE: &str = "state.toml";
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const MAX_SAVE_DELAY: Duration = Duration::from_secs(2);
 static STATE_FILE_LOCK: Mutex<()> = Mutex::new(());
 static LATEST_STATE: Mutex<Option<PersistentState>> = Mutex::new(None);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistentState {
     pub cps: u32,
     pub button: String,
@@ -112,29 +113,37 @@ pub fn load() -> PersistentState {
     PersistentState::default()
 }
 
+/// Restore staged preferences too when a backend crashes during a debounce.
+pub fn current_snapshot() -> PersistentState {
+    let staged = LATEST_STATE.lock().unwrap().clone();
+    staged.unwrap_or_else(load)
+}
+
 /// Spawn a background save worker. Returns a Sender that you can push
 /// new `PersistentState` snapshots to; the worker debounces writes.
-pub fn spawn_saver() -> Sender<()> {
+pub fn spawn_saver() -> SyncSender<()> {
     *LATEST_STATE.lock().unwrap() = Some(load());
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
     thread::spawn(move || {
-        let mut dirty = false;
-        loop {
-            match rx.recv_timeout(SAVE_DEBOUNCE) {
-                Ok(()) => dirty = true,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if dirty {
-                        flush();
-                        dirty = false;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if dirty {
-                        flush();
-                    }
+        // No periodic wakeups when clean. Signals coalesce in one slot; the
+        // snapshot lives separately, so a busy slider cannot grow the queue.
+        while rx.recv().is_ok() {
+            let deadline = Instant::now() + MAX_SAVE_DELAY;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     break;
                 }
+                match rx.recv_timeout(SAVE_DEBOUNCE.min(remaining)) {
+                    Ok(()) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        flush();
+                        return;
+                    }
+                }
             }
+            flush();
         }
     });
     tx
@@ -142,14 +151,14 @@ pub fn spawn_saver() -> Sender<()> {
 
 /// Stage synchronously: a delayed worker never writes an older snapshot over
 /// a newer global hotkey update received by the notification listener.
-pub fn queue_save(tx: &Sender<()>, previous: &PersistentState, snapshot: PersistentState) {
+pub fn queue_save(tx: &SyncSender<()>, previous: &PersistentState, snapshot: PersistentState) {
     let mut latest = LATEST_STATE.lock().unwrap();
     if let Some(current) = latest.as_mut() {
         merge_gui_changes(current, previous, snapshot);
     } else {
         *latest = Some(snapshot);
     }
-    let _ = tx.send(());
+    let _ = tx.try_send(());
 }
 
 fn merge_gui_changes(
@@ -175,9 +184,12 @@ fn merge_gui_changes(
 }
 
 pub fn flush() {
-    let latest = LATEST_STATE.lock().unwrap();
-    if let Some(snapshot) = latest.as_ref() {
-        save_to_disk(&state_path(), snapshot);
+    // Serialize writers, then take the freshest snapshot. Never hold the
+    // state mutex across fsync; GUI and notification updates stay responsive.
+    let _guard = STATE_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let latest = LATEST_STATE.lock().unwrap().clone();
+    if let Some(snapshot) = latest {
+        save_to_disk_locked(&state_path(), &snapshot);
     }
 }
 
@@ -205,6 +217,7 @@ fn save_to_disk_locked(path: &Path, snapshot: &PersistentState) {
 /// minimized or otherwise idle: the listener thread receives the status even
 /// when GNOME delays the next app logic pass.
 pub fn merge_backend_settings(
+    save_tx: &SyncSender<()>,
     cps: u32,
     button: String,
     mode: String,
@@ -212,18 +225,18 @@ pub fn merge_backend_settings(
     jitter_ms: u32,
     repeat_count: u32,
 ) {
-    let path = state_path();
     let mut latest = LATEST_STATE.lock().unwrap();
-    let mut snapshot = latest.clone().unwrap_or_else(load);
-    let _guard = STATE_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut snapshot = latest.clone().unwrap_or_default();
     snapshot.cps = cps.clamp(1, 1000);
     snapshot.button = button;
     snapshot.mode = mode;
     snapshot.randomize = randomize;
     snapshot.jitter_ms = jitter_ms.min(100);
     snapshot.repeat_count = repeat_count.min(1_000_000);
-    save_to_disk_locked(&path, &snapshot);
-    *latest = Some(snapshot);
+    if latest.as_ref() != Some(&snapshot) {
+        *latest = Some(snapshot);
+        let _ = save_tx.try_send(());
+    }
 }
 
 #[cfg(test)]

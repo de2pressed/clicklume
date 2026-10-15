@@ -56,6 +56,11 @@ fn main() {
         }
     };
 
+    if let Err(error) = stream.set_write_timeout(Some(std::time::Duration::from_secs(2))) {
+        eprintln!("failed to set socket timeout: {error}");
+        std::process::exit(6);
+    }
+
     if let Err(e) = stream.write_all(&json) {
         eprintln!("failed to write to socket: {e}");
         std::process::exit(6);
