@@ -150,3 +150,24 @@ with tempfile.TemporaryDirectory(prefix='clicklume-smoke-') as temporary:
                     gui.kill()
                     gui.wait()
     print('PASS: native GUI launch, backend crash recovery, IPC Quit recovery, graceful GUI shutdown')
+    with open(Path(temporary) / 'idle-gui.log', 'w') as log:
+        gui = subprocess.Popen([BIN / 'clicklume-gui'], env=env, stdout=log, stderr=log)
+        try:
+            wait_for(lambda: request('GetStatus'))
+            pid = wait_for(lambda: backend_pid(gui))
+            # No GUI interaction or status traffic while the native window
+            # becomes idle. SIGTERM must work without another repaint.
+            time.sleep(10)
+            gui.send_signal(signal.SIGTERM)
+            assert gui.wait(timeout=8) == 0
+            wait_for(lambda: not Path(SOCKET).exists())
+            assert not (Path('/proc') / str(pid)).exists(), 'Idle shutdown did not reap backend'
+        finally:
+            if gui.poll() is None:
+                gui.kill()
+                gui.wait()
+                try:
+                    request('Quit')
+                except (OSError, KeyError, ValueError):
+                    pass
+    print('PASS: idle native GUI SIGTERM shutdown and backend reaping without repaint')

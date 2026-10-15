@@ -22,7 +22,7 @@ REL_X/REL_Y declaration and unprivileged runtime.
 | GUI rendering | Periodic repaint for lifecycle work kept a healthy idle window rendering | Healthy idle windows render on input/status events; pending settings schedule a debounce deadline and missing-backend recovery retains a timer. |
 | Settings | Saver woke every 500ms while clean; each backend status synchronously serialized and fsynced settings | One-slot save notification queue; block while clean, debounce changes, and cap continuous-edit save delay at two seconds. Final quit flushes staged settings. |
 | Settings ordering | Deferred GUI status processing could persist an older snapshot over the listener's newer settings | The listener stages backend settings; the GUI updates its comparison baseline without saving that status again. Recovery restores staged preferences. |
-| CLI/shutdown | CLI writes had no timeout; GUI shutdown could detach a child waiter | Bound CLI writes and let the single background supervisor reap children. |
+| CLI/shutdown | CLI writes had no timeout; idle GNOME windows could defer GUI-thread signal handling | Bound CLI writes, reap children in one supervisor, and handle SIGINT/SIGTERM in the self-pipe worker without relying on repaints. |
 
 ## Resource boundaries
 
@@ -30,7 +30,7 @@ REL_X/REL_Y declaration and unprivileged runtime.
 - Commands: at most 4096 bytes, one-second read deadline including queue time, 200ms response-write timeout.
 - Notifications: at most 4096 bytes each; at most six pending GUI event categories.
 - Hotkeys: 64 queued actions; excess input is dropped rather than accumulating delayed actions.
-- Saves/signals: one pending notification each; snapshots are staged separately.
+- Saves: one pending notification; snapshots are staged separately. Signals use a bounded nonblocking self-pipe.
 - Recovery retries: exponential backoff capped at two seconds, plus a bounded startup wait.
 
 The application necessarily has event and click loops. Each persistent loop
@@ -44,7 +44,7 @@ mocked installer regressions, native Wayland release smoke, and backend/GUI
 resource checks. Native smoke covered startup, fragmented IPC, configured CPS
 bounds, subscription ownership, duplicate-backend rejection, mode-0600 socket,
 REL axes, five SIGKILL recoveries with old-process reaping, one clean IPC Quit
-recovery, and graceful GUI shutdown.
+recovery, graceful GUI shutdown, and idle-window SIGTERM/backend reaping.
 
 GUI measurements on this desktop (autoclicking disabled):
 

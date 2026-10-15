@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -176,13 +176,12 @@ extern "C" fn sigterm_handler(_sig: i32) {
     }
 }
 
-fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
-    let (tx, rx) = mpsc::sync_channel::<()>(1);
+fn install_signal_handler(shutting_down: Arc<AtomicBool>, backend_pid: Arc<AtomicU32>) {
     let mut pipefds = [0i32; 2];
     let r = unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC) };
     if r != 0 {
         log::warn!("Failed to create self-pipe for signal handling");
-        return rx;
+        return;
     }
     unsafe {
         let flags = libc::fcntl(pipefds[1], libc::F_GETFL);
@@ -206,16 +205,25 @@ fn install_signal_handler(ctx: egui::Context) -> Receiver<()> {
             match f.read(&mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if matches!(tx.try_send(()), Err(mpsc::TrySendError::Disconnected(_))) {
-                        break;
+                    // GNOME may defer an idle window's event-loop pass even
+                    // after request_repaint. Termination must not depend on
+                    // graphics callbacks, just like the global quit hotkey.
+                    shutting_down.store(true, Ordering::Release);
+                    let _ = ipc::send_blocking(GuiToBackend::Quit);
+                    state::flush();
+                    let deadline = Instant::now() + SOCKET_WAIT_TIMEOUT;
+                    while backend_pid.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(20));
                     }
-                    ctx.request_repaint();
+                    // Avoid renderer teardown from this background thread.
+                    // The kernel releases graphics/input handles atomically.
+                    unsafe { libc::_exit(0) };
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
     });
-    rx
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +514,6 @@ pub struct App {
     pub last_error: Option<String>,
 
     inbox: GuiInbox,
-    sig_rx: Option<Receiver<()>>,
     backend_child: Option<std::process::Child>,
     backend_pid: Arc<AtomicU32>,
     shutting_down: Arc<AtomicBool>,
@@ -543,7 +550,7 @@ impl App {
         let global_hotkeys_available = Arc::new(AtomicBool::new(false));
         let listener_hotkeys_available = global_hotkeys_available.clone();
 
-        let sig_rx = install_signal_handler(cc.egui_ctx.clone());
+        install_signal_handler(shutting_down.clone(), backend_pid.clone());
 
         let persistent = state::load();
         let save_tx = state::spawn_saver();
@@ -573,7 +580,6 @@ impl App {
             show_hotkey_settings: false,
             last_error: None,
             inbox: inbox.clone(),
-            sig_rx: Some(sig_rx),
             backend_child: None,
             backend_pid,
             shutting_down,
@@ -1155,20 +1161,6 @@ impl eframe::App for App {
                     log::warn!("Backend error: {}", e);
                 }
             }
-        }
-
-        // SIGTERM/SIGINT — graceful Quit + close.
-        let mut got_signal = false;
-        if let Some(ref mut rx) = self.sig_rx {
-            if rx.try_recv().is_ok() {
-                got_signal = true;
-            }
-        }
-        if got_signal {
-            log::info!("Received termination signal, sending Quit to backend");
-            self.quit();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
         }
 
         // Flush debounced settings update if deadline passed.
